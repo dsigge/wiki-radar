@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
+import re
 import requests
 from urllib.parse import quote
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+
+st.set_page_config(page_title="Wikipedia Gap Finder", layout="wide")
 
 # ---------- CONFIG ----------
 SUPPORTED_LANGS = ["en", "de", "fr", "es", "ar", "tr", "it", "ru", "pl"]
@@ -216,10 +220,82 @@ def get_summary(title, lang="en"):
     return DATA.get("extract", "").split(".")[0] + "."
 
 
+@st.cache_data(ttl=86400)
+def get_all_frauenrot_lists():
+    base_url = "https://de.wikipedia.org"
+    master_url = f"{base_url}/wiki/Wikipedia:WikiProjekt_Frauen/Frauen_in_Rot/Listen"
+    R = requests.get(master_url)
+    if R.status_code != 200:
+        return {}
+
+    html = R.text
+    matches = re.findall(
+        r'href="/wiki/(Wikipedia:WikiProjekt_Frauen/Frauen_in_Rot/Fehlende_Artikel.*?)"',
+        html)
+    unique = sorted(set(matches))
+    return {
+        match.split("/")[-1].replace("_", " "): base_url + "/wiki/" + match
+        for match in unique
+    }
+
+
+def extract_missing_names_from_list(url):
+    """Extracts redlinked names from a Wikipedia list page."""
+    html = requests.get(url).text
+    matches = re.findall(
+        r'href="\/w\/index\.php\?title=([^"&]+)&amp;action=edit"', html)
+    names = [
+        name.replace("_", " ") for name in matches
+        if not name.startswith("Wikipedia:")
+    ]
+    return list(set(names))  # Remove duplicates
+
+
+def extract_missing_names_from_list(url):
+    html = requests.get(url).text
+    soup = BeautifulSoup(html, "html.parser")
+    red_links = soup.find_all("a", class_="new")
+    names = [link.get("title") for link in red_links if link.get("title")]
+    return list(set(names))
+
+
 # ---------- STREAMLIT APP ----------
-st.set_page_config(page_title="Wikipedia Gap Finder", layout="wide")
-tab1, tab2, tab3 = st.tabs(
-    ["🧩 Category Checker", "📉 Top 500 Missing in DE", "🔍 Most Searched (DE)"])
+
+st.title("Wikipedia Gap Finder")
+
+st.markdown("""
+**Wikipedia Gap Finder** ist ein Tool zur datenbasierten Erkennung von Artikeln, die in der deutschen Wikipedia fehlen, aber in anderen Sprachversionen sehr häufig aufgerufen werden.
+
+Ziel ist es, Wikipedia-Autor:innen, Redaktionen und Interessierten zu helfen, **relevante Inhalte für die deutschsprachige Wikipedia zu identifizieren** – basierend auf tatsächlichen Nutzerinteressen.
+
+---
+
+### Wie funktioniert das Tool?
+
+Das Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
+
+1. **Kategorie-Check:**  
+   Gibt man eine Wikipedia-Kategorie ein (z. B. *20th-century philosophers*), zeigt das Tool an, welche Artikel in anderen Sprachen existieren, aber nicht in der deutschen Wikipedia – inkl. Seitenaufrufen, Kurzbeschreibung und Sprachen, in denen der Artikel vorhanden ist.
+
+2. **Top 500 fehlende Artikel:**  
+   Zeigt eine täglich aktualisierte Liste der meistbesuchten Artikel auf z. B. Englisch oder Spanisch, die noch nicht in der deutschen Wikipedia existieren. So erkennt man besonders gefragte Themen.
+
+3. **Such-Trends Deutschland:**  
+   Analysiert Suchtrends in der deutschen Wikipedia und gleicht sie mit existierenden Artikeln ab – ideal, um Themen zu erkennen, die häufig gesucht, aber (noch) nicht abgedeckt sind.
+
+---
+
+
+### Hinweise
+
+- Alle Daten stammen aus offiziellen Wikimedia-APIs (Pageviews, Wikidata, Categories)
+- Ergebnisse sind automatisch erzeugt und können redaktionelle Prüfung nicht ersetzen
+""")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🧩 Category Checker", "📉 Top 500 Missing in DE", "🔍 Most Searched (DE)",
+    "👩 Women in Red (Relevanzcheck)"
+])
 
 with tab1:
     st.header("🧩 Wikipedia Category Checker")
@@ -412,3 +488,95 @@ with tab3:
                                    mime="text/csv")
             else:
                 st.info("No articles found.")
+
+with tab4:
+    st.header("🟣 Relevanzcheck: Fehlende Frauenbiografien")
+    st.markdown(
+        "Wähle eine oder mehrere Listen aus dem Frauen-in-Rot-Projekt. Das Tool prüft, in welchen Sprachversionen Artikel existieren, welche Version am längsten ist – und wie viele Aufrufe diese Version hatte."
+    )
+
+    with st.spinner("Lade alle Listen des Frauen-in-Rot-Projekts..."):
+        frauenrot_lists = get_all_frauenrot_lists()
+
+    selected_lists = st.multiselect(
+        "Wähle eine oder mehrere Frauenlisten aus:",
+        options=list(frauenrot_lists.keys()))
+
+    if selected_lists and st.button("🔍 Relevanz analysieren"):
+        all_names = set()
+        with st.spinner("Lade Namen aus gewählten Listen..."):
+            for name in selected_lists:
+                url = frauenrot_lists[name]
+                names = extract_missing_names_from_list(url)
+                all_names.update(names)
+
+        st.markdown(
+            f"**Gesamt: {len(all_names)} Personen** werden analysiert.")
+
+        rows = []
+        for i, title in enumerate(sorted(all_names)):
+            try:
+                wikidata_id = get_wikidata_id(title)
+                if not wikidata_id:
+                    continue
+
+                langs = get_languages(title)
+                langs_str = ", ".join(langs)
+
+                # Größte Sprachversion finden
+                max_lang = None
+                max_bytes = -1
+                for lang in langs:
+                    resp = requests.get(
+                        f"https://{lang}.wikipedia.org/w/api.php",
+                        params={
+                            "action": "query",
+                            "prop": "revisions",
+                            "titles": title,
+                            "rvprop": "size",
+                            "format": "json"
+                        })
+                    data = resp.json()
+                    pages = data.get("query", {}).get("pages", {})
+                    for page in pages.values():
+                        size = page.get("revisions", [{}])[0].get("size", 0)
+                        if size > max_bytes:
+                            max_bytes = size
+                            max_lang = lang
+
+                views = get_pageviews(title, lang=max_lang)
+                summary = get_summary(title, lang=max_lang)
+                est_de = int(views * DE_ESTIMATE_FACTOR)
+                exists_de = article_exists_in_de(title)
+
+                wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(title)}"
+                google_url = f"https://www.google.com/search?q=\"{quote(title)}\"+site:.de"
+
+                rows.append({
+                    "Name":
+                    f'<a href="{wiki_url}" target="_blank">{title}</a>',
+                    "Sprache (größte Version)":
+                    max_lang,
+                    "Views (30d)":
+                    views,
+                    "Estimated DE Views":
+                    est_de,
+                    "DE Exists":
+                    "✅" if exists_de else "❌",
+                    "Sprachen":
+                    langs_str,
+                    "Summary":
+                    summary,
+                    "Google":
+                    f'<a href="{google_url}" target="_blank">Suchen</a>'
+                })
+            except Exception as e:
+                print(f"Fehler bei {title}: {e}")
+                continue
+
+        if rows:
+            df = pd.DataFrame(rows)
+            st.markdown(df.to_html(escape=False, index=False),
+                        unsafe_allow_html=True)
+        else:
+            st.info("Keine analysierbaren Artikel gefunden.")
