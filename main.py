@@ -50,6 +50,44 @@ def get_all_articles_recursive(category_name, lang="en", depth=2, limit=100):
     crawl(category_name, 0)
     return collected[:limit], len(collected)
 
+    def get_category_members_paged(category_name, lang="en", max_articles=5000):
+        category_prefix = "Kategorie:" if lang == "de" else "Category:"
+        base_url = f"https://{lang}.wikipedia.org/w/api.php"
+        collected = []
+        cmcontinue = None
+
+        while True:
+            params = {
+                "action": "query",
+                "list": "categorymembers",
+                "cmtitle": f"{category_prefix}{category_name}",
+                "cmtype": "page",
+                "cmlimit": "500",
+                "format": "json",
+            }
+            if cmcontinue:
+                params["cmcontinue"] = cmcontinue
+
+            response = requests.get(base_url, params=params, headers=HEADERS)
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            members = data.get("query", {}).get("categorymembers", [])
+            collected.extend(members)
+
+            if "continue" in data and "cmcontinue" in data["continue"]:
+                cmcontinue = data["continue"]["cmcontinue"]
+            else:
+                break
+
+            if len(collected) >= max_articles:
+                break
+
+        return collected, len(collected)
+
+
+
 
 def get_subcategories(category_name, lang="en"):
     category_prefix = "Kategorie:" if lang == "de" else "Category:"
@@ -121,6 +159,20 @@ def get_languages(title, lang="en"):
             return langs_sorted[:5] + (["..."]
                                        if len(langs_sorted) > 5 else [])
     return []
+
+
+@st.cache_data(ttl=86400)
+def get_sitelinks(qid):
+    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        if resp.status_code != 200 or not resp.text.strip():
+            return {}
+        data = resp.json()
+        return data.get("entities", {}).get(qid, {}).get("sitelinks", {})
+    except Exception as e:
+        print(f"❌ Fehler beim Laden von {qid}: {e}")
+        return {}
 
 
 def has_german_link(wikidata_id):
@@ -240,18 +292,6 @@ def get_all_frauenrot_lists():
 
 
 def extract_missing_names_from_list(url):
-    """Extracts redlinked names from a Wikipedia list page."""
-    html = requests.get(url).text
-    matches = re.findall(
-        r'href="\/w\/index\.php\?title=([^"&]+)&amp;action=edit"', html)
-    names = [
-        name.replace("_", " ") for name in matches
-        if not name.startswith("Wikipedia:")
-    ]
-    return list(set(names))  # Remove duplicates
-
-
-def extract_missing_names_from_list(url):
     html = requests.get(url).text
     soup = BeautifulSoup(html, "html.parser")
     red_links = soup.find_all("a", class_="new")
@@ -259,132 +299,194 @@ def extract_missing_names_from_list(url):
     return list(set(names))
 
 
+@st.cache_data(ttl=86400)
+def extract_qids_from_list(url):
+    html = requests.get(url).text
+    soup = BeautifulSoup(html, "html.parser")
+
+    qids = []
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 1:
+            continue
+        last_cell = cells[-1]
+        text = last_cell.get_text(strip=True)
+        if text.startswith("Q") and text[1:].isdigit():
+            qids.append(text)
+
+    return list(set(qids))
+
+def process_articles(members_batch, lang_code):
+    rows = []
+    for member in members_batch:
+        title = member["title"]
+
+        # Ankerlinks (z. B. "Breakbeat#Progressive_breaks") überspringen
+        if "#" in title:
+            continue
+
+        wikidata_id = get_wikidata_id(title, lang=lang_code)
+        de_exists = has_german_link(wikidata_id) if wikidata_id else False
+        langs = get_languages(wikidata_id) if wikidata_id else []
+        langs_str = ", ".join(langs)
+
+        normalized_title = normalize_title(title)
+        views = get_pageviews(normalized_title, lang=lang_code)
+        est_views = int(views * DE_ESTIMATE_FACTOR)
+
+        summary = get_summary(normalized_title, lang=lang_code)
+        short_summary = summary[:180] + "..." if len(summary) > 180 else summary
+
+        wiki_url = f"https://{lang_code}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+        link = f'<a href="{wiki_url}" target="_blank">{title}</a>'
+
+        rows.append({
+            "Title": link,
+            "DE Exists": "✅" if de_exists else "❌",
+            "Languages": langs_str,
+            "Views (30d)": views,
+            "Estimated DE Views": est_views,
+            "Summary": short_summary
+        })
+
+    return rows
+
+def process_articles(members, lang_code):
+    rows = []
+    for member in members:
+        title = member["title"]
+        wikidata_id = get_wikidata_id(title, lang=lang_code)
+        de_exists = has_german_link(wikidata_id) if wikidata_id else False
+        langs = get_languages(wikidata_id) if wikidata_id else []
+        langs_str = ", ".join(langs)
+        normalized_title = normalize_title(title)
+        views_en = get_pageviews(normalized_title, lang=lang_code)
+        est_views_de = int(views_en * DE_ESTIMATE_FACTOR)
+        summary = get_summary(title, lang=lang_code)
+        short_summary = summary[:180] + "..." if len(summary) > 180 else summary
+        wiki_url = f"https://{lang_code}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+        link = f'<a href="{wiki_url}" target="_blank">{title}</a>'
+
+        rows.append({
+            "Title": link,
+            "DE Exists": "✅" if de_exists else "❌",
+            "Languages": langs_str,
+            "Views (30d)": views_en,
+            "Estimated DE Views": est_views_de,
+            "Summary": short_summary
+        })
+    return rows
+
+
 # ---------- STREAMLIT APP ----------
 
-st.title("Wikipedia Gap Finder")
+st.title("Wikipedia Relevanz-Radar")
 
 st.markdown("""
-**Wikipedia Gap Finder** ist ein Tool zur datenbasierten Erkennung von Artikeln, die in der deutschen Wikipedia fehlen, aber in anderen Sprachversionen sehr häufig aufgerufen werden.
+Der **Wikipedia Relevanz-Radar** ist ein Tool zur datenbasierten Erkennung von Artikeln, die in der deutschen Wikipedia fehlen, aber in anderen Sprachversionen sehr häufig aufgerufen werden.
 
 Ziel ist es, Wikipedia-Autor:innen, Redaktionen und Interessierten zu helfen, **relevante Inhalte für die deutschsprachige Wikipedia zu identifizieren** – basierend auf tatsächlichen Nutzerinteressen.
 
 ---
 
-### Wie funktioniert das Tool?
-
-Das Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
-
-1. **Kategorie-Check:**  
-   Gibt man eine Wikipedia-Kategorie ein (z. B. *20th-century philosophers*), zeigt das Tool an, welche Artikel in anderen Sprachen existieren, aber nicht in der deutschen Wikipedia – inkl. Seitenaufrufen, Kurzbeschreibung und Sprachen, in denen der Artikel vorhanden ist.
-
-2. **Top 500 fehlende Artikel:**  
-   Zeigt eine täglich aktualisierte Liste der meistbesuchten Artikel auf z. B. Englisch oder Spanisch, die noch nicht in der deutschen Wikipedia existieren. So erkennt man besonders gefragte Themen.
-
-3. **Such-Trends Deutschland:**  
-   Analysiert Suchtrends in der deutschen Wikipedia und gleicht sie mit existierenden Artikeln ab – ideal, um Themen zu erkennen, die häufig gesucht, aber (noch) nicht abgedeckt sind.
-
----
-
-
-### Hinweise
-
-- Alle Daten stammen aus offiziellen Wikimedia-APIs (Pageviews, Wikidata, Categories)
-- Ergebnisse sind automatisch erzeugt und können redaktionelle Prüfung nicht ersetzen
 """)
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🧩 Category Checker", "📉 Top 500 Missing in DE", "🔍 Most Searched (DE)",
-    "👩 Women in Red (Relevanzcheck)"
+tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    "🙇🏻‍♂️ Info & Anleitung", "🔎 Kategorie-Analyse", "🔎 Meistaufgerufene int. Artikel vs. DE",
+    "🔎 Such-Trends vs. DE", "🔎 Rotfrauen-Projekt"
 ])
 
-with tab1:
-    st.header("🧩 Wikipedia Category Checker")
-    category_input = st.text_input("Enter Wikipedia category name:",
-                                   value="20th-century philosophers")
-    lang_code = st.selectbox("Select Wikipedia language:",
-                             options=SUPPORTED_LANGS,
-                             index=0)
-    limit = st.slider("Number of articles to check", 5, 500, 20)
-    use_subcats = st.checkbox(
-        "Include articles from subcategories (recursive)", value=True)
+with tab0:
 
-    if st.button("Check Category"):
-        with st.spinner("Fetching and analyzing articles..."):
+    st.markdown("### Wie funktioniert das Tool?")
+    st.markdown("""
+    Das Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
+
+    **1. Kategorie-Analyse:**  
+    Gibt man eine Wikipedia-Kategorie ein (z. B. *20th-century philosophers*), zeigt das Tool an, welche Artikel in anderen Sprachen existieren, aber nicht in der deutschen Wikipedia – inkl. Seitenaufrufen, Kurzbeschreibung und Sprachen, in denen der Artikel vorhanden ist.
+
+    **2. Meistaufgerufene int. Artikel vs. DE:**  
+    Zeigt eine täglich aktualisierte Liste der meistbesuchten Artikel auf z. B. Englisch oder Spanisch, die noch nicht in der deutschen Wikipedia existieren. So erkennt man besonders gefragte Themen.
+
+    **3. Such-Trends vs. DE:**  
+    Analysiert Suchtrends in der deutschen Wikipedia und gleicht sie mit existierenden Artikeln ab – ideal, um Themen zu erkennen, die häufig gesucht, aber (noch) nicht abgedeckt sind.
+
+    **4. Rotfrauen-Projekt:**
+    Analysiert Listen des Frauen-in-Rot-Projekts und zeigt, in welchen Sprachen Artikel existieren, welche Version am längsten ist – und wie viele Aufrufe diese Version hatte.
+    """)
+
+    st.markdown("### Hinweise")
+    st.markdown("""
+    - Alle Daten stammen aus offiziellen Wikimedia-APIs (Pageviews, Wikidata, Categories)  
+    - Ergebnisse sind automatisch erzeugt und können redaktionelle Prüfung nicht ersetzen
+    - Hast du Feedback? Ich bin auf Wikipedia unter *User:Fizzywater90* zu erreichen
+    """)
+
+with tab1:
+    st.header("📘 Kategorie-Analyse")
+    category_input = st.text_input("Enter Wikipedia category name:", value="20th-century philosophers")
+    lang_code = st.selectbox("Select Wikipedia language:", options=SUPPORTED_LANGS, index=0)
+    use_subcats = st.checkbox("Include articles from subcategories (recursive)", value=True)
+
+    # SessionState: Fortschritt zwischenspeichern
+    if "category_results" not in st.session_state:
+        st.session_state["category_results"] = []
+        st.session_state["category_cursor"] = 0
+        st.session_state["category_total"] = 0
+        st.session_state["category_members"] = []
+
+    if st.button("Kategorie analysieren & erste Artikel laden"):
+        with st.spinner("Lade alle Mitglieder der Kategorie..."):
             if use_subcats:
                 members, total_found = get_all_articles_recursive(
-                    category_input, lang=lang_code, depth=2, limit=limit)
+                    category_input, lang=lang_code, depth=2, limit=5000)
             else:
-                members = get_category_members(category_input, limit)
+                members = get_category_members(category_input, limit=5000)
                 total_found = len(members)
 
-            st.markdown(f"**{len(members)} articles found in category.**")
+            # Nur Hauptartikel (ohne Anker/Abschnitte)
+            filtered_members = [m for m in members if "#" not in m["title"]]
 
-            subcats = get_subcategories(category_input, lang=lang_code)
+            st.session_state["category_members"] = filtered_members
+            st.session_state["category_cursor"] = 0
+            st.session_state["category_total"] = len(filtered_members)
+            st.session_state["category_results"] = []
 
-            if len(members) < 5:
-                st.warning(
-                    f"⚠️ Only {len(members)} articles found. The category may be too narrow or abstract."
-                )
-                if subcats:
-                    st.markdown("Try one of these related categories instead:")
-                    for s in subcats:
-                        st.markdown(f"- `{s}`")
+        if st.session_state["category_members"]:
+            to_process = st.session_state["category_members"][:50]
+            with st.spinner("Analysiere Artikel..."):
+                rows = process_articles(to_process, lang_code)
+                st.session_state["category_results"].extend(rows)
+                st.session_state["category_results"].sort(key=lambda x: x["Views (30d)"], reverse=True)
+                st.session_state["category_cursor"] += len(to_process)
 
-            if total_found > 0:
-                scan_pct = (len(members) / total_found) * 100
-                st.markdown(
-                    f"📊 Scanned {len(members)} of {total_found} total articles ({scan_pct:.3f}%)"
-                )
+    # Weitere Artikel laden
+    if st.session_state["category_members"]:
+        total = st.session_state["category_total"]
+        current_cursor = st.session_state["category_cursor"]
+        next_cursor = min(current_cursor + 50, total)
+        to_process = st.session_state["category_members"][current_cursor:next_cursor]
 
-            rows = []
-            for member in members:
-                title = member["title"]
-                wikidata_id = get_wikidata_id(title)
-                de_exists = has_german_link(
-                    wikidata_id) if wikidata_id else False
-                langs = get_languages(wikidata_id) if wikidata_id else []
-                langs_str = ", ".join(langs)
-                normalized_title = normalize_title(title)
-                views_en = get_pageviews(normalized_title, lang=lang_code)
-                est_views_de = int(views_en * DE_ESTIMATE_FACTOR)
-                summary = get_summary(title)
-                short_summary = summary[:180] + "..." if len(
-                    summary) > 180 else summary
-                wiki_url = f"https://{lang_code}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
-                link = f'<a href="{wiki_url}" target="_blank">{title}</a>'
+        if to_process and st.button(f"Analysiere nächste {len(to_process)} Artikel"):
+            with st.spinner("Analysiere weitere Artikel..."):
+                rows = process_articles(to_process, lang_code)
+                st.session_state["category_results"].extend(rows)
+                st.session_state["category_results"].sort(key=lambda x: x["Views (30d)"], reverse=True)
+                st.session_state["category_cursor"] += len(to_process)
 
-                rows.append({
-                    "Title": link,
-                    "DE Exists": "✅" if de_exists else "❌",
-                    "Languages": langs_str,
-                    "Views (30d)": views_en,
-                    "Estimated DE Views": est_views_de,
-                    "Summary": short_summary
-                })
+        if st.session_state["category_results"]:
+            df = pd.DataFrame(st.session_state["category_results"])
+            st.markdown(f"**{st.session_state['category_cursor']} von {total} Artikeln analysiert.**")
+            st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                df_display = df.sort_values(
-                    by="Views (30d)", ascending=False).reset_index(drop=True)
-                st.markdown(df_display.to_html(escape=False),
-                            unsafe_allow_html=True)
-                csv = df_display.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV",
-                                   data=csv,
-                                   file_name="wikipedia_gap_results.csv",
-                                   mime="text/csv")
-            else:
-                st.warning("No articles found – nothing to display.")
+        if st.session_state["category_cursor"] < st.session_state["category_total"]:
+            st.info("🔁 Es sind weitere Artikel verfügbar – klicke erneut auf „Analysiere nächste …“")
+        else:
+            st.success("✅ Alle Artikel in dieser Kategorie wurden analysiert.")
 
-            if subcats:
-                st.markdown("---")
-                st.subheader("🔎 Related Subcategories")
-                st.markdown("Here are additional subcategories to explore:")
-                for s in subcats:
-                    st.markdown(f"- `{s}`")
 
 with tab2:
-    st.header("📉 Top 500 Missing in German Wikipedia")
+    st.header("Meistaufgerufene int. Artikel vs. DE")
     st.markdown(
         "This view shows the most viewed articles in another language Wikipedia that are missing in German Wikipedia."
     )
@@ -439,7 +541,7 @@ with tab2:
                 st.info("All top articles exist in German Wikipedia.")
 
 with tab3:
-    st.header("🔍 Most Searched Terms in Wikipedia (Missing in DE)")
+    st.header("🔍 Such-Trends vs. DE")
     lang_code = st.selectbox("Select Source Wikipedia language:",
                              options=SUPPORTED_LANGS,
                              index=0)
@@ -490,9 +592,10 @@ with tab3:
                 st.info("No articles found.")
 
 with tab4:
-    st.header("🟣 Relevanzcheck: Fehlende Frauenbiografien")
+    st.header("Rotfrauen-Projek")
     st.markdown(
-        "Wähle eine oder mehrere Listen aus dem Frauen-in-Rot-Projekt. Das Tool prüft, in welchen Sprachversionen Artikel existieren, welche Version am längsten ist – und wie viele Aufrufe diese Version hatte."
+        "Wähle eine oder mehrere Listen aus dem Frauen-in-Rot-Projekt. Das Tool prüft, in welchen Sprachversionen Artikel existieren, "
+        "welche Version am längsten ist – und wie viele Aufrufe diese Version hatte."
     )
 
     with st.spinner("Lade alle Listen des Frauen-in-Rot-Projekts..."):
@@ -502,81 +605,121 @@ with tab4:
         "Wähle eine oder mehrere Frauenlisten aus:",
         options=list(frauenrot_lists.keys()))
 
-    if selected_lists and st.button("🔍 Relevanz analysieren"):
-        all_names = set()
-        with st.spinner("Lade Namen aus gewählten Listen..."):
-            for name in selected_lists:
-                url = frauenrot_lists[name]
-                names = extract_missing_names_from_list(url)
-                all_names.update(names)
+    if selected_lists:
+        if st.button("🔍 Relevanz analysieren"):
+            with st.spinner(
+                    "Analysiere Relevanz für ausgewählte Personen... (bitte Tab nicht wechseln)"
+            ):
+                all_qids = set()
+                for name in selected_lists:
+                    url = frauenrot_lists[name]
+                    try:
+                        qids = extract_qids_from_list(url)
+                        all_qids.update(qids)
+                    except Exception as e:
+                        print(f"Fehler beim Laden der Liste {name}: {e}")
+                        continue
 
-        st.markdown(
-            f"**Gesamt: {len(all_names)} Personen** werden analysiert.")
+                st.markdown(
+                    f"**Gesamt: {len(all_qids)} Personen** werden analysiert.")
+                rows = []
 
-        rows = []
-        for i, title in enumerate(sorted(all_names)):
-            try:
-                wikidata_id = get_wikidata_id(title)
-                if not wikidata_id:
-                    continue
+                for i, qid in enumerate(all_qids):
+                    try:
+                        print(f"🔎 Analysiere {qid} ({i+1}/{len(all_qids)})")
+                        sitelinks = get_sitelinks(qid)
+                        if not sitelinks:
+                            continue
 
-                langs = get_languages(title)
-                langs_str = ", ".join(langs)
+                        sizes = {}
+                        for lang_key, link in sitelinks.items():
+                            if not lang_key.endswith("wiki"):
+                                continue
+                            lang = lang_key.replace("wiki", "")
+                            title = link["title"]
+                            rev_url = f"https://{lang}.wikipedia.org/w/api.php"
+                            rev_params = {
+                                "action": "query",
+                                "prop": "revisions",
+                                "titles": title,
+                                "rvprop": "size",
+                                "format": "json"
+                            }
+                            try:
+                                resp = requests.get(rev_url,
+                                                    params=rev_params,
+                                                    headers=HEADERS,
+                                                    timeout=10)
+                                if resp.status_code != 200 or not resp.text.strip(
+                                ):
+                                    continue
+                                data = resp.json()
+                                pages = data.get("query", {}).get("pages", {})
+                                for page in pages.values():
+                                    size = page.get("revisions",
+                                                    [{}])[0].get("size", 0)
+                                    sizes[lang] = (size, title)
+                            except Exception as e:
+                                print(
+                                    f"Fehler bei Revisionsabfrage {qid} ({lang}): {e}"
+                                )
+                                continue
 
-                # Größte Sprachversion finden
-                max_lang = None
-                max_bytes = -1
-                for lang in langs:
-                    resp = requests.get(
-                        f"https://{lang}.wikipedia.org/w/api.php",
-                        params={
-                            "action": "query",
-                            "prop": "revisions",
-                            "titles": title,
-                            "rvprop": "size",
-                            "format": "json"
+                        if not sizes:
+                            continue
+
+                        max_lang, (max_bytes,
+                                   max_title) = max(sizes.items(),
+                                                    key=lambda x: x[1][0])
+                        views = get_pageviews(max_title, lang=max_lang)
+                        summary = get_summary(max_title, lang=max_lang)
+                        est_de = int(views * DE_ESTIMATE_FACTOR)
+                        exists_de = article_exists_in_de(max_title)
+
+                        wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title)}"
+                        google_url = f"https://www.google.com/search?q=\"{quote(max_title)}\"+site:.de"
+                        langs_str = ", ".join(
+                            sorted([
+                                k.replace("wiki", "")
+                                for k in sitelinks.keys() if k.endswith("wiki")
+                            ]))
+
+                        rows.append({
+                            "Name":
+                            f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
+                            "Sprache (größte Version)":
+                            max_lang,
+                            "Views (30d)":
+                            views,
+                            "Estimated DE Views":
+                            est_de,
+                            "DE Exists":
+                            "✅" if exists_de else "❌",
+                            "Sprachen":
+                            langs_str,
+                            "Summary":
+                            summary,
+                            "Google":
+                            f'<a href="{google_url}" target="_blank">Suchen</a>'
                         })
-                    data = resp.json()
-                    pages = data.get("query", {}).get("pages", {})
-                    for page in pages.values():
-                        size = page.get("revisions", [{}])[0].get("size", 0)
-                        if size > max_bytes:
-                            max_bytes = size
-                            max_lang = lang
 
-                views = get_pageviews(title, lang=max_lang)
-                summary = get_summary(title, lang=max_lang)
-                est_de = int(views * DE_ESTIMATE_FACTOR)
-                exists_de = article_exists_in_de(title)
+                    except Exception as e:
+                        print(f"❌ Fehler bei {qid}: {e}")
+                        continue
 
-                wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(title)}"
-                google_url = f"https://www.google.com/search?q=\"{quote(title)}\"+site:.de"
-
-                rows.append({
-                    "Name":
-                    f'<a href="{wiki_url}" target="_blank">{title}</a>',
-                    "Sprache (größte Version)":
-                    max_lang,
-                    "Views (30d)":
-                    views,
-                    "Estimated DE Views":
-                    est_de,
-                    "DE Exists":
-                    "✅" if exists_de else "❌",
-                    "Sprachen":
-                    langs_str,
-                    "Summary":
-                    summary,
-                    "Google":
-                    f'<a href="{google_url}" target="_blank">Suchen</a>'
-                })
-            except Exception as e:
-                print(f"Fehler bei {title}: {e}")
-                continue
-
-        if rows:
-            df = pd.DataFrame(rows)
-            st.markdown(df.to_html(escape=False, index=False),
-                        unsafe_allow_html=True)
-        else:
-            st.info("Keine analysierbaren Artikel gefunden.")
+                if rows:
+                    df = pd.DataFrame(rows)
+                    st.markdown(f"""
+                        <div style='height: 600px; overflow-y: auto'>
+                            {df.to_html(escape=False, index=False)}
+                        </div>
+                        """,
+                                unsafe_allow_html=True)
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ CSV herunterladen",
+                        data=csv,
+                        file_name="frauenbiografien_gapcheck.csv",
+                        mime="text/csv")
+                else:
+                    st.info("Keine analysierbaren Artikel gefunden.")
