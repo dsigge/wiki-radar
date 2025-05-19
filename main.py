@@ -8,6 +8,10 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from statistics import mean, stdev
 
+import logging
+logging.getLogger("streamlit.runtime.scriptrunner.script_runner").setLevel(logging.ERROR)
+
+
 st.set_page_config(page_title="Wikipedia Gap Finder", layout="wide")
 
 # ---------- CONFIG ----------
@@ -131,7 +135,28 @@ def get_all_articles_recursive(category_name, lang="en", depth=2, limit=100):
 
         return collected, len(collected)
 
+def get_missing_titles_parallel(titles, lang):
+    def check(title):
+        return title if not article_exists_in_de(title, lang=lang) else None
 
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(check, titles))
+    return [title for title in results if title]
+
+def process_articles_with_progress(titles, lang):
+    results = []
+    progress = st.progress(0)
+    status = st.empty()
+    total = len(titles)
+
+    for i, title in enumerate(titles):
+        result = process_articles_concurrent([title], lang)
+        if result:
+            results.extend(result)
+        progress.progress((i + 1) / total)
+        status.text(f"{i+1}/{total} Artikel verarbeitet")
+
+    return results
 
 
 def get_subcategories(category_name, lang="en"):
@@ -447,9 +472,9 @@ def get_daily_views_stats(title, lang="en", days=90):
     if cv > 1.0:
         status = "🧨 Viral"
     elif cv < 0.3:
-        status = "💎 Stabil"
+        status = "💎 Stable"
     else:
-        status = "⚖️ Gemischt"
+        status = "⚖️ Mixed"
 
     return round(avg), round(std_dev), round(cv, 2), round(peak_ratio, 2), status
 
@@ -468,8 +493,8 @@ Ziel ist es, Wikipedia-Autor:innen, Redaktionen und Interessierten zu helfen, **
 """)
 
 tab0, tab1, tab2, tab3, tab4, tab5= st.tabs([
-    "🙇🏻‍♂️ Info & Anleitung", "🔎 Kategorie-Analyse", "🔎 Meistaufgerufene int. Artikel vs. DE",
-    "🔎 Such-Trends vs. DE", "🔎 Rotlink-Frauen-Projekt", "🔎 Eigene Artikelliste analysieren"
+    "🙇🏻‍♂️ Info & Anleitung", "🔎 1) Kategorie-Analyse", "🔎 2) Meistgelesen vs. DE (Schnell)",
+    "🔎 3) Meistgelesen vs. DE (Gefiltert)", "🔎 4) Rotlink-Frauen-Projekt", "🔎 5) Eigene Artikelliste analysieren"
 ])
 
 with tab0:
@@ -478,16 +503,17 @@ with tab0:
     st.markdown("""
     Das Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
 
-    **Viralität: CV (Coefficient of Variation) misst, wie stark die täglichen Seitenaufrufe eines Artikels im Verhältnis zum Durchschnitt schwanken. Daraus ergibt sich eine Einschätzung zur Viralität: stabil (💎), gemischt (⚖️) oder viral (🧨).**
-                
+    **Viralität: CV (Coefficient of Variation) misst, wie stark die täglichen Seitenaufrufe eines Artikels im Verhältnis zum Durchschnitt schwanken. Daraus ergibt sich eine Einschätzung zur Viralität: stable (💎), mixed (⚖️) oder viral (🧨).**
+    **Was sind "Estimated DE Views"? Mit einem Faktor 0.12 werden mögliche Aufrufe in der deutschsprachigen Wikipedia berechnet. Ein randomisiertes Sample aus englischen Wikipedia-Artikeln ergab, dass deutsche Artikel  
+                            
     **1. Kategorie-Analyse:**  
     Gibt man eine Wikipedia-Kategorie ein (z. B. *20th-century philosophers*), zeigt das Tool an, welche Artikel in anderen Sprachen existieren, aber nicht in der deutschen Wikipedia – inkl. Seitenaufrufen, Kurzbeschreibung und Sprachen, in denen der Artikel vorhanden ist.
 
-    **2. Meistaufgerufene int. Artikel vs. DE:**  
+    **2. Meistgelesen vs. DE (Schnell):**  
     Zeigt eine täglich aktualisierte Liste der meistbesuchten Artikel auf z. B. Englisch oder Spanisch, die noch nicht in der deutschen Wikipedia existieren. So erkennt man besonders gefragte Themen.
 
-    **3. Such-Trends vs. DE:**  
-    Analysiert Suchtrends in der deutschen Wikipedia und gleicht sie mit existierenden Artikeln ab – ideal, um Themen zu erkennen, die häufig gesucht, aber (noch) nicht abgedeckt sind.
+    **3. Meistgelesen vs. DE (Gefiltert):**  
+    Gleiche Abfrage wie in Tab 2, nur filtert das System hier in DE existierende Artikel schon heraus. Vorsicht, deutlich langsamer.
 
     **4. Rotlink-Frauen-Projekt:**
     Analysiert Listen des Frauen-in-Rot-Projekts und zeigt, in welchen Sprachen Artikel existieren, welche Version am längsten ist – und wie viele Aufrufe diese Version hatte.
@@ -505,7 +531,7 @@ with tab0:
     """)
 
 with tab1:
-    st.header("📘 Kategorie-Analyse")
+    st.header("1) Kategorie-Analyse")
     category_input = st.text_input("Enter Wikipedia category name:", value="20th-century philosophers")
     lang_code = st.selectbox("Select Wikipedia language:", options=SUPPORTED_LANGS, index=0)
     use_subcats = st.checkbox("Include articles from subcategories (recursive)", value=True)
@@ -568,31 +594,8 @@ with tab1:
         else:
             st.success("✅ Alle Artikel in dieser Kategorie wurden analysiert.")
 
-
 with tab2:
-    st.header("Meistaufgerufene int. Artikel vs. DE")
-    st.markdown("Zeigt meistbesuchte Artikel in anderer Sprache, die in DE fehlen.")
-
-    selected_lang = st.selectbox("Select source language:", options=SUPPORTED_LANGS, index=0)
-
-    if st.button(f"Load Top Missing ({selected_lang} → DE)"):
-        with st.spinner(f"Lade meistgelesene Artikel aus {selected_lang}.wikipedia.org..."):
-            top_articles = get_top_articles(lang=selected_lang, days=30, limit=1000)
-            titles = [title for title, _ in top_articles if not article_exists_in_de(title, lang=selected_lang)]
-            results = process_articles_concurrent(titles, selected_lang)
-
-            if results:
-                df = pd.DataFrame(results)
-                df = df.sort_values(by="Views (30d)", ascending=False)
-                st.markdown("### Top Missing Articles")
-                st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV", data=csv, file_name="top500_missing_de.csv", mime="text/csv")
-            else:
-                st.info("Alle Top-Artikel existieren bereits auf Deutsch.")
-
-with tab3:
-    st.header("🔍 Such-Trends vs. DE")
+    st.header("🔍 2) Gefragte Artikel, die in DE fehlen (Schneller)")
     lang_code = st.selectbox("Select Source Wikipedia language:", options=SUPPORTED_LANGS, index=0)
     period = st.selectbox("Select time period:", ["Yesterday", "Past 30 Days (aggregated)"])
     limit = st.slider("Number of top articles to check", 10, 5000, 1000)
@@ -613,8 +616,47 @@ with tab3:
             else:
                 st.info("Keine Artikel gefunden.")
 
+with tab3:
+    st.header("3) Gefragte Artikel, die in DE fehlen (Gefiltert, Langsamer)")
+    st.markdown("Zeigt meistbesuchte Artikel in anderer Sprache, die in DE fehlen. Zeigt mit großer Wahrscheinlichkeit viele virale Artikel an. Kann gegebenenfalls Artikel enthalten, die es schon in DE gibt.")
+
+    selected_lang = st.selectbox("Select source language:", options=SUPPORTED_LANGS, index=0)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        days = st.selectbox("Zeitraum (Tage)", [7, 14, 30, 90], index=2)
+    with col2:
+        limit = st.selectbox("Anzahl Artikel", [100, 250, 500, 1000], index=3)
+
+    if st.button(f"Load Top Missing ({selected_lang} → DE)"):
+        with st.spinner(f"Lade meistgelesene Artikel aus {selected_lang}.wikipedia.org..."):
+            top_articles = get_top_articles(lang=selected_lang, days=days, limit=limit)
+            titles = [title for title, _ in top_articles]
+
+            st.info("🔍 Prüfe, welche Artikel auf Deutsch fehlen...")
+            missing_titles = get_missing_titles_parallel(titles, selected_lang)
+
+            if missing_titles:
+                st.info("📊 Verarbeite fehlende Artikel...")
+                results = process_articles_with_progress(missing_titles, selected_lang)
+
+                df = pd.DataFrame(results)
+                df = df.sort_values(by="Views (30d)", ascending=False)
+
+                st.markdown("### Top Missing Articles")
+                st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download CSV", data=csv, file_name="top_missing_articles.csv", mime="text/csv")
+            else:
+                st.success("🎉 Alle Top-Artikel existieren bereits auf Deutsch.")
+
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 with tab4:
-    st.header("Rotfrauen-Projek")
+    st.header("🔴 Rotfrauen-Projekt")
     st.markdown(
         "Wähle eine oder mehrere Listen aus dem Frauen-in-Rot-Projekt. Das Tool prüft, in welchen Sprachversionen Artikel existieren, "
         "welche Version am längsten ist – und wie viele Aufrufe diese Version hatte."
@@ -629,9 +671,7 @@ with tab4:
 
     if selected_lists:
         if st.button("🔍 Relevanz analysieren"):
-            with st.spinner(
-                    "Analysiere Relevanz für ausgewählte Personen... (bitte Tab nicht wechseln)"
-            ):
+            with st.spinner("Analysiere Relevanz für ausgewählte Personen... (bitte Tab nicht wechseln)"):
                 all_qids = set()
                 for name in selected_lists:
                     url = frauenrot_lists[name]
@@ -642,16 +682,13 @@ with tab4:
                         print(f"Fehler beim Laden der Liste {name}: {e}")
                         continue
 
-                st.markdown(
-                    f"**Gesamt: {len(all_qids)} Personen** werden analysiert.")
-                rows = []
+                st.markdown(f"**Gesamt: {len(all_qids)} Personen** werden analysiert.")
 
-                for i, qid in enumerate(all_qids):
+                def process_qid(qid, i, total):
                     try:
-                        print(f"🔎 Analysiere {qid} ({i+1}/{len(all_qids)})")
                         sitelinks = get_sitelinks(qid)
                         if not sitelinks:
-                            continue
+                            return None
 
                         sizes = {}
                         for lang_key, link in sitelinks.items():
@@ -668,31 +705,19 @@ with tab4:
                                 "format": "json"
                             }
                             try:
-                                resp = requests.get(rev_url,
-                                                    params=rev_params,
-                                                    headers=HEADERS,
-                                                    timeout=10)
-                                if resp.status_code != 200 or not resp.text.strip(
-                                ):
-                                    continue
+                                resp = requests.get(rev_url, params=rev_params, headers=HEADERS, timeout=5)
                                 data = resp.json()
                                 pages = data.get("query", {}).get("pages", {})
                                 for page in pages.values():
-                                    size = page.get("revisions",
-                                                    [{}])[0].get("size", 0)
+                                    size = page.get("revisions", [{}])[0].get("size", 0)
                                     sizes[lang] = (size, title)
-                            except Exception as e:
-                                print(
-                                    f"Fehler bei Revisionsabfrage {qid} ({lang}): {e}"
-                                )
+                            except Exception:
                                 continue
 
                         if not sizes:
-                            continue
+                            return None
 
-                        max_lang, (max_bytes,
-                                   max_title) = max(sizes.items(),
-                                                    key=lambda x: x[1][0])
+                        max_lang, (max_bytes, max_title) = max(sizes.items(), key=lambda x: x[1][0])
                         views = get_pageviews(max_title, lang=max_lang)
                         summary = get_summary(max_title, lang=max_lang)
                         est_de = int(views * DE_ESTIMATE_FACTOR)
@@ -700,34 +725,37 @@ with tab4:
 
                         wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title)}"
                         google_url = f"https://www.google.com/search?q=\"{quote(max_title)}\"+site:.de"
-                        langs_str = ", ".join(
-                            sorted([
-                                k.replace("wiki", "")
-                                for k in sitelinks.keys() if k.endswith("wiki")
-                            ]))
+                        langs_str = ", ".join(sorted([k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")]))
 
-                        rows.append({
-                            "Name":
-                            f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
-                            "Sprache (größte Version)":
-                            max_lang,
-                            "Views (30d)":
-                            views,
-                            "Estimated DE Views":
-                            est_de,
-                            "DE Exists":
-                            "✅" if exists_de else "❌",
-                            "Sprachen":
-                            langs_str,
-                            "Summary":
-                            summary,
-                            "Google":
-                            f'<a href="{google_url}" target="_blank">Suchen</a>'
-                        })
+                        return {
+                            "Name": f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
+                            "Sprache (größte Version)": max_lang,
+                            "Views (30d)": views,
+                            "Estimated DE Views": est_de,
+                            "DE Exists": "✅" if exists_de else "❌",
+                            "Sprachen": langs_str,
+                            "Summary": summary,
+                            "Google": f'<a href="{google_url}" target="_blank">Suchen</a>'
+                        }
 
                     except Exception as e:
                         print(f"❌ Fehler bei {qid}: {e}")
-                        continue
+                        return None
+
+                rows = []
+                total = len(all_qids)
+                progress = st.progress(0)
+
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {
+                        executor.submit(process_qid, qid, i, total): qid
+                        for i, qid in enumerate(all_qids)
+                    }
+                    for i, future in enumerate(as_completed(futures)):
+                        result = future.result()
+                        if result:
+                            rows.append(result)
+                        progress.progress((i + 1) / total)
 
                 if rows:
                     df = pd.DataFrame(rows)
@@ -735,8 +763,7 @@ with tab4:
                         <div style='height: 600px; overflow-y: auto'>
                             {df.to_html(escape=False, index=False)}
                         </div>
-                        """,
-                                unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button(
                         "⬇️ CSV herunterladen",
@@ -744,27 +771,31 @@ with tab4:
                         file_name="frauenbiografien_gapcheck.csv",
                         mime="text/csv")
                 else:
-                    st.info("Keine analysierbaren Artikel gefunden.")
-
+                    st.info("Keine analysierbaren Artikel gefunden.") 
 with tab5:
     st.header("🔎 Eigene Artikelliste analysieren")
     st.markdown("Gib eine Liste von Artikeln ein, getrennt durch Kommas. Das Tool prüft, ob es eine deutsche Version gibt, wie viele Views sie in der Quellsprache haben und schätzt das DE-Potenzial.")
 
-    input_text = st.text_area("Artikel eingeben (kommagetrennt)", "Einstein, Simone de Beauvoir, Yung Hurn")
+    input_text = st.text_area("Artikel eingeben (kommagetrennt)", "Albert Einstein, Simone de Beauvoir, Yung Hurn")
     input_lang = st.selectbox("Sprache der Artikelliste", options=SUPPORTED_LANGS, index=0)
 
-    if st.button("🔍 Liste analysieren"):
-        titles = [t.strip() for t in input_text.split(",") if t.strip()]
-        if not titles:
-            st.info("Bitte mindestens einen Artikelnamen eingeben.")
-        else:
-            with st.spinner("Analysiere Artikel..."):
-                results = process_articles_concurrent(titles, lang=input_lang)
+if st.button("🔍 Analysieren"):
+    titles = [t.strip() for t in input_text.split(",") if t.strip()]
+    if not titles:
+        st.info("Bitte mindestens einen Artikelnamen eingeben.")
+    else:
+        with st.spinner("Analysiere Artikel..."):
+            results = process_articles_concurrent(titles, lang=input_lang)
 
-            if results:
+        if results:
+            df = pd.DataFrame(results)
+            if not df.empty:
                 df = df.sort_values(by="Views (30d)", ascending=False)
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Download CSV", data=csv, file_name="eigene_liste_check.csv", mime="text/csv")
             else:
-                st.info("Keine gültigen Artikel erkannt.")
+                st.error("Keine Daten geladen – bitte überprüfe deine Artikelliste.")
+        else:
+            st.info("Keine gültigen Artikel erkannt.")
+
