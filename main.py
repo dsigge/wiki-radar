@@ -667,10 +667,12 @@ with tab4:
 
     selected_lists = st.multiselect(
         "Wähle eine oder mehrere Frauenlisten aus:",
-        options=list(frauenrot_lists.keys()))
+        options=list(frauenrot_lists.keys()),
+        key="tab4_multiselect"
+    )
 
     if selected_lists:
-        if st.button("🔍 Relevanz analysieren"):
+        if st.button("🔍 Relevanz analysieren", key="tab4_button"):
             with st.spinner("Analysiere Relevanz für ausgewählte Personen... (bitte Tab nicht wechseln)"):
                 all_qids = set()
                 for name in selected_lists:
@@ -684,11 +686,17 @@ with tab4:
 
                 st.markdown(f"**Gesamt: {len(all_qids)} Personen** werden analysiert.")
 
-                def process_qid(qid, i, total):
+                failed_qids = []
+                rows = []
+                total = len(all_qids)
+                progress = st.progress(0)
+                status_text = st.empty()
+
+                def process_qid_robust(qid):
                     try:
                         sitelinks = get_sitelinks(qid)
                         if not sitelinks:
-                            return None
+                            raise ValueError("Keine Sprachversionen vorhanden")
 
                         sizes = {}
                         for lang_key, link in sitelinks.items():
@@ -715,16 +723,19 @@ with tab4:
                                 continue
 
                         if not sizes:
-                            return None
+                            raise ValueError("Keine gültige Artikelgröße gefunden")
 
                         max_lang, (max_bytes, max_title) = max(sizes.items(), key=lambda x: x[1][0])
+
                         views = get_pageviews(max_title, lang=max_lang)
                         summary = get_summary(max_title, lang=max_lang)
                         est_de = int(views * DE_ESTIMATE_FACTOR)
                         exists_de = article_exists_in_de(max_title)
 
                         wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title)}"
-                        google_url = f"https://www.google.com/search?q=\"{quote(max_title)}\"+site:.de"
+                        query = f'"{max_title}" site:.de'
+                        google_url = f"https://www.google.com/search?q={quote_plus(query)}"
+
                         langs_str = ", ".join(sorted([k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")]))
 
                         return {
@@ -739,26 +750,33 @@ with tab4:
                         }
 
                     except Exception as e:
-                        print(f"❌ Fehler bei {qid}: {e}")
+                        failed_qids.append(qid)
                         return None
-
-                rows = []
-                total = len(all_qids)
-                progress = st.progress(0)
 
                 with ThreadPoolExecutor(max_workers=10) as executor:
                     futures = {
-                        executor.submit(process_qid, qid, i, total): qid
-                        for i, qid in enumerate(all_qids)
+                        executor.submit(process_qid_robust, qid): qid
+                        for qid in all_qids
                     }
                     for i, future in enumerate(as_completed(futures)):
                         result = future.result()
                         if result:
                             rows.append(result)
                         progress.progress((i + 1) / total)
+                        status_text.text(f"{i+1}/{total} verarbeitet...")
+
+                st.markdown("---")
+
+                # Ergebnisanzeige
+                failed_count = len(failed_qids)
+                if failed_count > 0:
+                    st.markdown(f"⚠️ Bei **{failed_count} von {total} Artikeln** gab es Fehler (z. B. keine Artikelgröße abrufbar oder kein vollständiger Wikipedia-Link).")
+                else:
+                    st.success("✅ Alle Artikel erfolgreich verarbeitet.")
 
                 if rows:
                     df = pd.DataFrame(rows)
+                    df = df.sort_values(by="Views (30d)", ascending=False)
                     st.markdown(f"""
                         <div style='height: 600px; overflow-y: auto'>
                             {df.to_html(escape=False, index=False)}
@@ -771,7 +789,9 @@ with tab4:
                         file_name="frauenbiografien_gapcheck.csv",
                         mime="text/csv")
                 else:
-                    st.info("Keine analysierbaren Artikel gefunden.") 
+                    st.info("Keine analysierbaren Artikel gefunden.")
+
+
 with tab5:
     st.header("🔎 Eigene Artikelliste analysieren")
     st.markdown("Gib eine Liste von Artikeln ein, getrennt durch Kommas. Das Tool prüft, ob es eine deutsche Version gibt, wie viele Views sie in der Quellsprache haben und schätzt das DE-Potenzial.")
@@ -798,4 +818,6 @@ if st.button("🔍 Analysieren"):
                 st.error("Keine Daten geladen – bitte überprüfe deine Artikelliste.")
         else:
             st.info("Keine gültigen Artikel erkannt.")
+
+            
 
