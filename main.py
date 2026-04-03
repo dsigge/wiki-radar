@@ -16,7 +16,7 @@ st.set_page_config(page_title="Wikipedia Relevanz-Radar", layout="wide")
 # ---------- CONFIG ----------
 SUPPORTED_LANGS = ["en", "de", "fr", "es", "ar", "tr", "it", "ru", "pl"]
 DE_ESTIMATE_FACTOR = 0.12
-HEADERS = {"User-Agent": "WikipediaGapFinder/0.3 (daniel.sigge@web.de)"}
+HEADERS = {"User-Agent": "WikipediaGapFinder/0.4 (daniel.sigge@web.de)"}
 REQUEST_TIMEOUT = 10
 
 
@@ -125,11 +125,31 @@ def has_german_link(wikidata_id):
     return "dewiki" in entity.get("sitelinks", {})
 
 
-def exists_in_german_via_langlinks(title, source_lang="en"):
-    url = f"https://{source_lang}.wikipedia.org/w/api.php"
+def normalize_title(title, lang="en"):
+    url = f"https://{lang}.wikipedia.org/w/api.php"
     params = {
         "action": "query",
         "titles": title,
+        "redirects": 1,
+        "format": "json"
+    }
+    r = safe_get(url, params=params)
+    if not r:
+        return title.replace(" ", "_")
+
+    data = r.json()
+    pages = data.get("query", {}).get("pages", {})
+    for page in pages.values():
+        return page.get("title", title).replace(" ", "_")
+    return title.replace(" ", "_")
+
+
+def exists_in_german_via_langlinks(title, source_lang="en"):
+    normalized = normalize_title(title, lang=source_lang)
+    url = f"https://{source_lang}.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "titles": normalized,
         "prop": "langlinks",
         "lllang": "de",
         "redirects": 1,
@@ -148,30 +168,48 @@ def exists_in_german_via_langlinks(title, source_lang="en"):
 
 
 @st.cache_data(ttl=86400)
-def article_exists_in_de(title, lang="en"):
-    wikidata_id = get_wikidata_id(title, lang=lang)
-    via_wikidata = has_german_link(wikidata_id) if wikidata_id else False
-    via_langlinks = exists_in_german_via_langlinks(title, source_lang=lang)
-    return via_wikidata or via_langlinks
+def get_german_article_title(title, source_lang="en"):
+    normalized = normalize_title(title, lang=source_lang)
 
-
-def normalize_title(title, lang="en"):
-    url = f"https://{lang}.wikipedia.org/w/api.php"
+    # 1) zuerst direkte langlinks
+    url = f"https://{source_lang}.wikipedia.org/w/api.php"
     params = {
         "action": "query",
-        "titles": title,
+        "titles": normalized,
+        "prop": "langlinks",
+        "lllang": "de",
         "redirects": 1,
         "format": "json"
     }
-    r = safe_get(url, params=params)
-    if not r:
-        return title.replace(" ", "_")
 
-    data = r.json()
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        return page.get("title", title).replace(" ", "_")
-    return title.replace(" ", "_")
+    r = safe_get(url, params=params)
+    if r:
+        data = r.json()
+        pages = data.get("query", {}).get("pages", {})
+        for page in pages.values():
+            langlinks = page.get("langlinks", [])
+            if langlinks:
+                de_title = langlinks[0].get("*")
+                if de_title:
+                    return de_title
+
+    # 2) fallback über wikidata sitelinks
+    wikidata_id = get_wikidata_id(normalized, lang=source_lang)
+    if wikidata_id:
+        entity_url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
+        r2 = safe_get(entity_url)
+        if r2:
+            data2 = r2.json()
+            sitelinks = data2.get("entities", {}).get(wikidata_id, {}).get("sitelinks", {})
+            if "dewiki" in sitelinks:
+                return sitelinks["dewiki"].get("title")
+
+    return None
+
+
+@st.cache_data(ttl=86400)
+def article_exists_in_de(title, lang="en"):
+    return get_german_article_title(title, source_lang=lang) is not None
 
 
 def get_pageviews(title, lang="en", days=30):
@@ -416,15 +454,14 @@ def get_sitelinks(qid):
 def process_articles_concurrent(titles, lang):
     def process_single(title):
         try:
-            wikidata_id = get_wikidata_id(title, lang=lang)
-            de_exists_wikidata = has_german_link(wikidata_id) if wikidata_id else False
-            de_exists_langlinks = exists_in_german_via_langlinks(title, source_lang=lang)
-            de_exists = de_exists_wikidata or de_exists_langlinks
+            normalized = normalize_title(title, lang=lang)
+            de_title = get_german_article_title(normalized, source_lang=lang)
+            de_exists = de_title is not None
 
+            wikidata_id = get_wikidata_id(normalized, lang=lang)
             langs = get_languages(wikidata_id) if wikidata_id else []
             langs_str = ", ".join(langs)
 
-            normalized = normalize_title(title, lang=lang)
             views = get_pageviews(normalized, lang=lang)
             est_views = int(views * DE_ESTIMATE_FACTOR)
 
@@ -432,10 +469,11 @@ def process_articles_concurrent(titles, lang):
             summary = get_summary(normalized, lang=lang)
             short_summary = summary[:180] + "..." if len(summary) > 180 else summary
 
-            wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+            wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(normalized)}"
 
             return {
-                "Title": f'<a href="{wiki_url}" target="_blank">{title}</a>',
+                "Title": f'<a href="{wiki_url}" target="_blank">{normalized.replace("_", " ")}</a>',
+                "German Title": de_title if de_title else "",
                 "Languages": langs_str,
                 "Views (30d)": views,
                 "Estimated DE Views": est_views,
@@ -448,6 +486,7 @@ def process_articles_concurrent(titles, lang):
         except Exception as e:
             return {
                 "Title": title,
+                "German Title": "",
                 "Languages": "",
                 "Views (30d)": 0,
                 "Estimated DE Views": 0,
@@ -487,10 +526,10 @@ def get_top_viral_articles(lang="en", limit=10, source_pool=100):
         yesterday_views = get_yesterday_views(normalized, lang=lang)
         avg, std_dev, cv, peak_ratio, virality = get_daily_views_stats(normalized, lang=lang)
 
-        wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+        wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(normalized)}"
 
         rows.append({
-            "Title": f'<a href="{wiki_url}" target="_blank">{title}</a>',
+            "Title": f'<a href="{wiki_url}" target="_blank">{normalized.replace("_", " ")}</a>',
             "Views (Yesterday)": yesterday_views,
             "CV": cv,
             "Viralität": virality
@@ -548,8 +587,10 @@ with tab0:
 Der **Wikipedia Relevanz-Radar** hilft dabei, relevante Artikel zu finden, die in anderen Sprachversionen stark gelesen werden.
 
 Neu:
-- pro Tab kannst du jetzt **selbst umschalten**, ob Artikel mit vorhandener DE-Version angezeigt werden sollen
-- zusätzlicher Start-Tab mit **Top-Viral-Artikeln von gestern** in DE und EN
+- pro Tab kannst du **selbst umschalten**, ob Artikel mit vorhandener DE-Version angezeigt werden sollen
+- zusätzlicher Start-Tab mit **Top-Viral-Artikeln von gestern**
+- robustere DE-Erkennung über **langlinks + Wikidata**
+- neue Spalte **German Title**, damit sichtbar wird, welcher DE-Artikel gefunden wurde
 """)
 
 with tab1:
@@ -742,7 +783,8 @@ with tab4:
                     views = get_pageviews(max_title, lang=max_lang)
                     summary = get_summary(max_title, lang=max_lang)
                     est_de = int(views * DE_ESTIMATE_FACTOR)
-                    exists_de = article_exists_in_de(max_title, lang=max_lang)
+                    de_title = get_german_article_title(max_title, source_lang=max_lang)
+                    exists_de = de_title is not None
 
                     wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title.replace(' ', '_'))}"
                     query = f'"{max_title}" site:.de'
@@ -754,6 +796,7 @@ with tab4:
 
                     return {
                         "Name": f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
+                        "German Title": de_title if de_title else "",
                         "Sprache (größte Version)": max_lang,
                         "Views (30d)": views,
                         "Estimated DE Views": est_de,
