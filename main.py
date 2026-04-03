@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import requests
+import time
 from urllib.parse import quote, quote_plus
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -34,14 +35,22 @@ def safe_numeric(value, default=0):
         return default
 
 
-def safe_get(url, params=None, timeout=REQUEST_TIMEOUT):
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-        if r.status_code != 200:
+def safe_get(url, params=None, timeout=REQUEST_TIMEOUT, retries=3, pause=0.6):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(pause * (attempt + 1))
+                continue
             return None
-        return r
-    except Exception:
-        return None
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(pause * (attempt + 1))
+            else:
+                return None
+    return None
 
 
 def prepare_dataframe_for_sorting(df):
@@ -59,12 +68,10 @@ def prepare_dataframe_for_sorting(df):
 def filter_missing_in_de(rows, only_missing=True):
     if not only_missing:
         return rows
-    filtered = []
-    for row in rows:
-        exists_value = row.get("Exists in DE", row.get("DE Exists", "❌"))
-        if exists_value == "❌":
-            filtered.append(row)
-    return filtered
+    return [
+        row for row in rows
+        if row.get("Exists in DE", row.get("DE Exists")) == "❌"
+    ]
 
 
 def views_format(x):
@@ -254,6 +261,26 @@ def get_summary(title, lang="en"):
     extract = data.get("extract", "")
     return extract[:300] if extract else ""
 
+@st.cache_data(ttl=86400)
+def get_wikidata_id_via_titles(title, lang="en"):
+    url = "https://www.wikidata.org/w/api.php"
+    params = {
+        "action": "wbgetentities",
+        "sites": f"{lang}wiki",
+        "titles": title.replace("_", " "),
+        "format": "json"
+    }
+    r = safe_get(url, params=params)
+    if not r:
+        return None
+
+    data = r.json()
+    entities = data.get("entities", {})
+    for qid, entity in entities.items():
+        if qid != "-1":
+            return qid
+    return None
+
 
 def get_daily_views_stats(title, lang="en", days=90):
     end_date = datetime.today()
@@ -394,7 +421,7 @@ def get_missing_titles_parallel(titles, lang):
     def check(title):
         return title if not article_exists_in_de(title, lang=lang) else None
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         results = list(executor.map(check, titles))
     return [title for title in results if title]
 
@@ -455,7 +482,9 @@ def process_articles_concurrent(titles, lang):
     def process_single(title):
         try:
             normalized = normalize_title(title, lang=lang)
-            de_title = get_german_article_title(normalized, source_lang=lang)
+            wikidata_id = get_wikidata_id(normalized, lang=source_lang)
+            if not wikidata_id:
+                wikidata_id = get_wikidata_id_via_titles(normalized, lang=source_lang)
             de_exists = de_title is not None
 
             wikidata_id = get_wikidata_id(normalized, lang=lang)
@@ -490,13 +519,13 @@ def process_articles_concurrent(titles, lang):
                 "Languages": "",
                 "Views (30d)": 0,
                 "Estimated DE Views": 0,
-                "Exists in DE": "❌",
+                "Exists in DE": "❓",
                 "CV": None,
                 "Viralität": "Fehler",
                 "Summary": f"Fehler: {e}"
             }
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         return list(executor.map(process_single, titles))
 
 
