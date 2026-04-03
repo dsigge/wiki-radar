@@ -531,7 +531,7 @@ tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab0:
     st.markdown("### Wie funktioniert das Tool?")
     st.markdown("""
-    Das Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
+    Dieses Tool greift auf öffentlich zugängliche Wikipedia-Statistiken und Wikidata-Verknüpfungen zu, um Lücken zu erkennen. Es bietet drei Hauptfunktionen:
 
     **Viralität:** CV (Coefficient of Variation) misst, wie stark die täglichen Seitenaufrufe eines Artikels im Verhältnis zum Durchschnitt schwanken. Daraus ergibt sich eine Einschätzung zur Viralität: stable (💎), mixed (⚖️) oder viral (🧨).
 
