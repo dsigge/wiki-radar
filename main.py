@@ -14,10 +14,9 @@ st.set_page_config(page_title="Wikipedia Relevanz-Radar", layout="wide")
 # ---------- CONFIG ----------
 SUPPORTED_LANGS = ["en", "de", "fr", "es", "ar", "tr", "it", "ru", "pl"]
 DE_ESTIMATE_FACTOR = 0.12
-HEADERS = {"User-Agent": "WikipediaGapFinder/0.5 (daniel.sigge@web.de)"}
+HEADERS = {"User-Agent": "WikipediaGapFinder/0.6 (daniel.sigge@web.de)"}
 REQUEST_TIMEOUT = 10
 
-# MediaWiki API title limits
 MW_TITLES_PER_REQUEST = 50
 WD_IDS_PER_REQUEST = 50
 
@@ -71,6 +70,45 @@ def prepare_dataframe_for_sorting(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def reorder_columns(df, context="default"):
+    preferred_orders = {
+        "default": [
+            "Title",
+            "CV",
+            "Viralität",
+            "Views (30d)",
+            "Views (Yesterday)",
+            "Estimated DE Views",
+            "Exists in DE",
+            "German Title",
+            "Summary",
+        ],
+        "frauen": [
+            "Name",
+            "CV",
+            "Viralität",
+            "Views (30d)",
+            "Estimated DE Views",
+            "Exists in DE",
+            "German Title",
+            "Sprache (größte Version)",
+            "Summary",
+            "Google",
+        ],
+        "start": [
+            "Title",
+            "CV",
+            "Viralität",
+            "Views (Yesterday)",
+        ],
+    }
+
+    order = preferred_orders.get(context, preferred_orders["default"])
+    existing = [col for col in order if col in df.columns]
+    remaining = [col for col in df.columns if col not in existing]
+    return df[existing + remaining]
 
 
 def filter_missing_in_de(rows, only_missing=True):
@@ -192,22 +230,11 @@ def get_wikidata_sitelinks_batch(qids):
 
 
 def get_batch_article_info(titles, lang="en"):
-    """
-    Returns mapping:
-    original_title -> {
-        normalized_title,
-        qid,
-        de_title,
-        languages,
-        lookup_failed
-    }
-    """
     info = {
         t: {
             "normalized_title": normalize_title_fallback(t),
             "qid": None,
             "de_title": None,
-            "languages": [],
             "lookup_failed": False,
         }
         for t in titles
@@ -248,7 +275,11 @@ def get_batch_article_info(titles, lang="en"):
 
         for original in chunk_titles:
             resolved = alias_map.get(original, original)
-            page = page_by_title.get(resolved) or page_by_title.get(resolved.replace("_", " ")) or page_by_title.get(resolved.replace(" ", "_"))
+            page = (
+                page_by_title.get(resolved)
+                or page_by_title.get(resolved.replace("_", " "))
+                or page_by_title.get(resolved.replace(" ", "_"))
+            )
 
             if not page:
                 continue
@@ -265,7 +296,6 @@ def get_batch_article_info(titles, lang="en"):
             info[original]["qid"] = qid
             info[original]["de_title"] = de_title
 
-    # Wikidata fallback + languages
     qids = [v["qid"] for v in info.values() if v["qid"]]
     sitelinks_map = get_wikidata_sitelinks_batch(qids)
 
@@ -277,10 +307,6 @@ def get_batch_article_info(titles, lang="en"):
         sitelinks = sitelinks_map.get(qid, {})
         if not meta["de_title"] and "dewiki" in sitelinks:
             meta["de_title"] = sitelinks["dewiki"].get("title")
-
-        langs = [k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")]
-        langs_sorted = sorted(langs)
-        meta["languages"] = langs_sorted[:8] + (["..."] if len(langs_sorted) > 8 else [])
 
     return info
 
@@ -460,7 +486,6 @@ def process_articles_batch(
         meta = batch_info.get(original_title, {})
         normalized_title = meta.get("normalized_title", normalize_title_fallback(original_title))
         de_title = meta.get("de_title")
-        languages = meta.get("languages", [])
         lookup_failed = meta.get("lookup_failed", False)
 
         if de_title:
@@ -474,12 +499,12 @@ def process_articles_batch(
 
         row = {
             "Title": f'<a href="{wiki_url}" target="_blank">{normalized_title.replace("_", " ")}</a>',
+            "CV": None,
+            "Viralität": "",
             "German Title": de_title if de_title else "",
-            "Languages": ", ".join(languages),
             "Exists in DE": exists_in_de,
         }
 
-        # Views
         if known_views is not None:
             views = known_views.get(original_title)
         else:
@@ -488,19 +513,14 @@ def process_articles_batch(
         row[view_column] = views
         row["Estimated DE Views"] = int(views * DE_ESTIMATE_FACTOR) if isinstance(views, (int, float)) else None
 
-        # Summary
         if include_summary:
             summary = get_summary(normalized_title, lang=lang) or ""
             row["Summary"] = summary[:180] + "..." if len(summary) > 180 else summary
 
-        # Stats
         if include_stats:
             avg, std_dev, cv, peak_ratio, virality = get_daily_views_stats(normalized_title, lang=lang, days=30)
             row["CV"] = cv
             row["Viralität"] = virality
-        else:
-            row["CV"] = None
-            row["Viralität"] = ""
 
         return row
 
@@ -508,31 +528,6 @@ def process_articles_batch(
         rows = list(executor.map(enrich, titles))
 
     return rows
-
-
-def process_articles_with_progress(titles, lang):
-    batch_info = get_batch_article_info(titles, lang=lang)
-    results = []
-    progress = st.progress(0)
-    status = st.empty()
-    total = len(titles)
-
-    for i, title in enumerate(titles):
-        row = process_articles_batch(
-            [title],
-            lang=lang,
-            known_views=None,
-            view_column="Views (30d)",
-            include_summary=True,
-            include_stats=True,
-            max_workers=1,
-        )
-        if row:
-            results.extend(row)
-        progress.progress((i + 1) / total)
-        status.text(f"{i+1}/{total} Artikel verarbeitet")
-
-    return results
 
 
 @st.cache_data(ttl=21600)
@@ -557,8 +552,9 @@ def get_top_viral_articles(lang="en", limit=10, source_pool=20):
 
     df = pd.DataFrame(rows)
     df = prepare_dataframe_for_sorting(df)
-    df = df.sort_values(by=["CV", "Views (Yesterday)"], ascending=[False, False]).head(limit)
-    return df
+    df = reorder_columns(df, context="start")
+    df = df.sort_values(by=["CV", "Views (Yesterday)"], ascending=[False, False])
+    return df.head(limit)
 
 
 # ---------- UI ----------
@@ -609,12 +605,12 @@ with tab_info:
     st.markdown("""
 Dieses Tool sucht nach relevanten Artikeln in anderen Sprachversionen und prüft, ob sie in der deutschen Wikipedia existieren.
 
-Wichtige Punkte:
-- **Exists in DE = ✅**: deutscher Artikel wurde gefunden
-- **Exists in DE = ❌**: kein deutscher Artikel gefunden
-- **Exists in DE = ❓**: Prüfung war technisch unsicher / unvollständig
+Bedeutung:
+- **✅** deutscher Artikel gefunden
+- **❌** kein deutscher Artikel gefunden
+- **❓** technische Unsicherheit bei der Prüfung
 
-Wenn der Filter „Artikel mit vorhandener DE-Version ausblenden“ aktiv ist, werden **nur bestätigte ❌** gezeigt.
+Wenn der Filter aktiv ist, werden nur bestätigte **❌** angezeigt.
 """)
 
 with tab1:
@@ -693,6 +689,7 @@ with tab1:
         if display_rows:
             df = pd.DataFrame(display_rows)
             df = prepare_dataframe_for_sorting(df)
+            df = reorder_columns(df, context="default")
             df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
             st.markdown(f"**{st.session_state['category_cursor']} von {total} Artikeln analysiert.**")
             st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -720,7 +717,7 @@ with tab2:
                 known_views=known_views,
                 view_column=view_col,
                 include_summary=False,
-                include_stats=False,
+                include_stats=True,
                 max_workers=4,
             )
 
@@ -729,6 +726,7 @@ with tab2:
             if results:
                 df = pd.DataFrame(results)
                 df = prepare_dataframe_for_sorting(df)
+                df = reorder_columns(df, context="default")
                 df = df.sort_values(by=view_col, ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
                 csv = df.to_csv(index=False).encode("utf-8")
@@ -755,7 +753,11 @@ with tab3:
 
             if only_missing_tab3:
                 batch_info = get_batch_article_info(titles, lang=selected_lang)
-                titles = [t for t in titles if batch_info.get(t, {}).get("de_title") is None and not batch_info.get(t, {}).get("lookup_failed", False)]
+                titles = [
+                    t for t in titles
+                    if batch_info.get(t, {}).get("de_title") is None
+                    and not batch_info.get(t, {}).get("lookup_failed", False)
+                ]
                 known_views = {t: known_views[t] for t in titles if t in known_views}
 
             if titles:
@@ -773,6 +775,7 @@ with tab3:
                 if results:
                     df = pd.DataFrame(results)
                     df = prepare_dataframe_for_sorting(df)
+                    df = reorder_columns(df, context="default")
                     df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                     st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
@@ -844,9 +847,11 @@ with tab4:
 
                     max_lang, (_, max_title) = max(sizes.items(), key=lambda x: x[1][0])
 
-                    views = get_pageviews(max_title.replace(" ", "_"), lang=max_lang, days=30)
-                    summary = get_summary(max_title.replace(" ", "_"), lang=max_lang)
+                    title_for_api = max_title.replace(" ", "_")
+                    views = get_pageviews(title_for_api, lang=max_lang, days=30)
+                    summary = get_summary(title_for_api, lang=max_lang)
                     est_de = int(views * DE_ESTIMATE_FACTOR) if isinstance(views, (int, float)) else None
+                    _, _, cv, _, virality = get_daily_views_stats(title_for_api, lang=max_lang, days=30)
 
                     single_info = get_batch_article_info([max_title], lang=max_lang).get(max_title, {})
                     de_title = single_info.get("de_title")
@@ -857,20 +862,19 @@ with tab4:
                     else:
                         exists_de = "❌"
 
-                    wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title.replace(' ', '_'))}"
+                    wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(title_for_api)}"
                     query = f'"{max_title}" site:.de'
                     google_url = f"https://www.google.com/search?q={quote_plus(query)}"
 
-                    langs = sorted([k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")])
-
                     return {
                         "Name": f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
+                        "CV": cv,
+                        "Viralität": virality,
                         "German Title": de_title if de_title else "",
                         "Sprache (größte Version)": max_lang,
                         "Views (30d)": views,
                         "Estimated DE Views": est_de,
                         "Exists in DE": exists_de,
-                        "Sprachen": ", ".join(langs[:8] + (["..."] if len(langs) > 8 else [])),
                         "Summary": summary[:180] + "..." if len(summary) > 180 else summary,
                         "Google": f'<a href="{google_url}" target="_blank">Suchen</a>'
                     }
@@ -878,12 +882,13 @@ with tab4:
                 except Exception:
                     return {
                         "Name": qid,
+                        "CV": None,
+                        "Viralität": "Fehler",
                         "German Title": "",
                         "Sprache (größte Version)": "",
                         "Views (30d)": None,
                         "Estimated DE Views": None,
                         "Exists in DE": "❓",
-                        "Sprachen": "",
                         "Summary": "Fehler",
                         "Google": ""
                     }
@@ -900,6 +905,7 @@ with tab4:
             if rows:
                 df = pd.DataFrame(rows)
                 df = prepare_dataframe_for_sorting(df)
+                df = reorder_columns(df, context="frauen")
                 df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
@@ -934,6 +940,7 @@ with tab5:
             if results:
                 df = pd.DataFrame(results)
                 df = prepare_dataframe_for_sorting(df)
+                df = reorder_columns(df, context="default")
                 df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
