@@ -8,31 +8,44 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean, stdev
-import logging
-
-logging.getLogger("streamlit.runtime.scriptrunner.script_runner").setLevel(logging.ERROR)
 
 st.set_page_config(page_title="Wikipedia Relevanz-Radar", layout="wide")
 
 # ---------- CONFIG ----------
 SUPPORTED_LANGS = ["en", "de", "fr", "es", "ar", "tr", "it", "ru", "pl"]
 DE_ESTIMATE_FACTOR = 0.12
-HEADERS = {"User-Agent": "WikipediaGapFinder/0.4 (daniel.sigge@web.de)"}
+HEADERS = {"User-Agent": "WikipediaGapFinder/0.5 (daniel.sigge@web.de)"}
 REQUEST_TIMEOUT = 10
+
+# MediaWiki API title limits
+MW_TITLES_PER_REQUEST = 50
+WD_IDS_PER_REQUEST = 50
 
 
 # ---------- HELPERS ----------
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
 def safe_numeric(value, default=0):
     if value is None:
         return default
     if isinstance(value, str):
         value = value.replace(",", "").strip()
-        if value in ("", "n/a", "N/A", "-", "❌", "None"):
+        if value in ("", "n/a", "N/A", "-", "❌", "❓", "None"):
             return default
     try:
         return float(value)
     except (ValueError, TypeError):
         return default
+
+
+def views_format(x):
+    try:
+        return f"{int(x):,}".replace(",", ".")
+    except Exception:
+        return str(x)
 
 
 def safe_get(url, params=None, timeout=REQUEST_TIMEOUT, retries=3, pause=0.6):
@@ -54,84 +67,24 @@ def safe_get(url, params=None, timeout=REQUEST_TIMEOUT, retries=3, pause=0.6):
 
 
 def prepare_dataframe_for_sorting(df):
-    if "Views (30d)" in df.columns:
-        df["Views (30d)"] = pd.to_numeric(df["Views (30d)"], errors="coerce").fillna(0)
-    if "Views (Yesterday)" in df.columns:
-        df["Views (Yesterday)"] = pd.to_numeric(df["Views (Yesterday)"], errors="coerce").fillna(0)
-    if "Estimated DE Views" in df.columns:
-        df["Estimated DE Views"] = pd.to_numeric(df["Estimated DE Views"], errors="coerce").fillna(0)
-    if "CV" in df.columns:
-        df["CV"] = pd.to_numeric(df["CV"], errors="coerce")
+    for col in ["Views (30d)", "Views (Yesterday)", "Estimated DE Views", "CV"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
 def filter_missing_in_de(rows, only_missing=True):
     if not only_missing:
         return rows
-    return [
-        row for row in rows
-        if row.get("Exists in DE", row.get("DE Exists")) == "❌"
-    ]
+    return [row for row in rows if row.get("Exists in DE") == "❌"]
 
 
-def views_format(x):
-    try:
-        return f"{int(x):,}".replace(",", ".")
-    except Exception:
-        return str(x)
-
-
-# ---------- WIKIPEDIA / WIKIDATA ----------
-def get_wikidata_id(article_title, lang="en"):
-    url = f"https://{lang}.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "prop": "pageprops",
-        "titles": article_title,
-        "redirects": 1,
-        "format": "json"
-    }
-    r = safe_get(url, params=params)
-    if not r:
-        return None
-
-    data = r.json()
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        if "pageprops" in page and "wikibase_item" in page["pageprops"]:
-            return page["pageprops"]["wikibase_item"]
-    return None
+# ---------- BASIC WIKIPEDIA ----------
+def normalize_title_fallback(title: str) -> str:
+    return title.replace(" ", "_")
 
 
 @st.cache_data(ttl=86400)
-def get_languages(wikidata_id):
-    if not wikidata_id:
-        return []
-
-    url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
-    r = safe_get(url)
-    if not r:
-        return []
-
-    data = r.json()
-    sitelinks = data.get("entities", {}).get(wikidata_id, {}).get("sitelinks", {})
-    langs = [k.replace("wiki", "") for k in sitelinks if k.endswith("wiki")]
-    langs_sorted = sorted(langs)
-    return langs_sorted[:8] + (["..."] if len(langs_sorted) > 8 else [])
-
-
-def has_german_link(wikidata_id):
-    if not wikidata_id:
-        return False
-    url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
-    r = safe_get(url)
-    if not r:
-        return False
-    data = r.json()
-    entity = data.get("entities", {}).get(wikidata_id, {})
-    return "dewiki" in entity.get("sitelinks", {})
-
-
 def normalize_title(title, lang="en"):
     url = f"https://{lang}.wikipedia.org/w/api.php"
     params = {
@@ -142,111 +95,32 @@ def normalize_title(title, lang="en"):
     }
     r = safe_get(url, params=params)
     if not r:
-        return title.replace(" ", "_")
+        return normalize_title_fallback(title)
 
     data = r.json()
     pages = data.get("query", {}).get("pages", {})
     for page in pages.values():
         return page.get("title", title).replace(" ", "_")
-    return title.replace(" ", "_")
-
-
-def exists_in_german_via_langlinks(title, source_lang="en"):
-    normalized = normalize_title(title, lang=source_lang)
-    url = f"https://{source_lang}.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "titles": normalized,
-        "prop": "langlinks",
-        "lllang": "de",
-        "redirects": 1,
-        "format": "json"
-    }
-    r = safe_get(url, params=params)
-    if not r:
-        return False
-
-    data = r.json()
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        if page.get("langlinks"):
-            return True
-    return False
+    return normalize_title_fallback(title)
 
 
 @st.cache_data(ttl=86400)
-def get_german_article_title(title, source_lang="en"):
-    normalized = normalize_title(title, lang=source_lang)
-
-    # 1) zuerst direkte langlinks
-    url = f"https://{source_lang}.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "titles": normalized,
-        "prop": "langlinks",
-        "lllang": "de",
-        "redirects": 1,
-        "format": "json"
-    }
-
-    r = safe_get(url, params=params)
-    if r:
-        data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        for page in pages.values():
-            langlinks = page.get("langlinks", [])
-            if langlinks:
-                de_title = langlinks[0].get("*")
-                if de_title:
-                    return de_title
-
-    # 2) fallback über wikidata sitelinks
-    wikidata_id = get_wikidata_id(normalized, lang=source_lang)
-    if wikidata_id:
-        entity_url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
-        r2 = safe_get(entity_url)
-        if r2:
-            data2 = r2.json()
-            sitelinks = data2.get("entities", {}).get(wikidata_id, {}).get("sitelinks", {})
-            if "dewiki" in sitelinks:
-                return sitelinks["dewiki"].get("title")
-
-    return None
-
-
-@st.cache_data(ttl=86400)
-def article_exists_in_de(title, lang="en"):
-    return get_german_article_title(title, source_lang=lang) is not None
-
-
 def get_pageviews(title, lang="en", days=30):
     end_date = datetime.today()
     start_date = end_date - timedelta(days=days)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
     encoded = quote(title, safe="")
-    url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{lang}.wikipedia/all-access/all-agents/{encoded}/daily/{start_str}/{end_str}"
+    url = (
+        f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
+        f"{lang}.wikipedia/all-access/all-agents/{encoded}/daily/{start_str}/{end_str}"
+    )
     r = safe_get(url)
     if not r:
-        return 0
+        return None
 
     data = r.json()
     return sum(item.get("views", 0) for item in data.get("items", []))
-
-
-def get_yesterday_views(title, lang="en"):
-    end_date = datetime.today() - timedelta(days=1)
-    day_str = end_date.strftime("%Y%m%d")
-    encoded = quote(title, safe="")
-    url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{lang}.wikipedia/all-access/all-agents/{encoded}/daily/{day_str}/{day_str}"
-    r = safe_get(url)
-    if not r:
-        return 0
-    data = r.json()
-    items = data.get("items", [])
-    if not items:
-        return 0
-    return items[0].get("views", 0)
 
 
 @st.cache_data(ttl=86400)
@@ -256,42 +130,24 @@ def get_summary(title, lang="en"):
     r = safe_get(url)
     if not r:
         return ""
-
     data = r.json()
-    extract = data.get("extract", "")
-    return extract[:300] if extract else ""
+    return data.get("extract", "")
+
 
 @st.cache_data(ttl=86400)
-def get_wikidata_id_via_titles(title, lang="en"):
-    url = "https://www.wikidata.org/w/api.php"
-    params = {
-        "action": "wbgetentities",
-        "sites": f"{lang}wiki",
-        "titles": title.replace("_", " "),
-        "format": "json"
-    }
-    r = safe_get(url, params=params)
-    if not r:
-        return None
-
-    data = r.json()
-    entities = data.get("entities", {})
-    for qid, entity in entities.items():
-        if qid != "-1":
-            return qid
-    return None
-
-
-def get_daily_views_stats(title, lang="en", days=90):
+def get_daily_views_stats(title, lang="en", days=30):
     end_date = datetime.today()
     start_date = end_date - timedelta(days=days)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
     encoded = quote(title, safe="")
-    url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{lang}.wikipedia/all-access/all-agents/{encoded}/daily/{start_str}/{end_str}"
+    url = (
+        f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
+        f"{lang}.wikipedia/all-access/all-agents/{encoded}/daily/{start_str}/{end_str}"
+    )
     r = safe_get(url)
     if not r:
-        return 0, 0, 0, 0, "❌ Fehler"
+        return None, None, None, None, "Fehler"
 
     items = r.json().get("items", [])
     daily_views = [i["views"] for i in items if "views" in i]
@@ -314,7 +170,158 @@ def get_daily_views_stats(title, lang="en", days=90):
     return round(avg), round(std_dev), round(cv, 2), round(peak_ratio, 2), status
 
 
-# ---------- CATEGORY / TOP ----------
+# ---------- BATCH METADATA ----------
+def get_wikidata_sitelinks_batch(qids):
+    result = {}
+    for chunk in chunks(list(set([q for q in qids if q])), WD_IDS_PER_REQUEST):
+        url = "https://www.wikidata.org/w/api.php"
+        params = {
+            "action": "wbgetentities",
+            "ids": "|".join(chunk),
+            "props": "sitelinks",
+            "format": "json"
+        }
+        r = safe_get(url, params=params)
+        if not r:
+            continue
+        data = r.json()
+        entities = data.get("entities", {})
+        for qid, entity in entities.items():
+            result[qid] = entity.get("sitelinks", {})
+    return result
+
+
+def get_batch_article_info(titles, lang="en"):
+    """
+    Returns mapping:
+    original_title -> {
+        normalized_title,
+        qid,
+        de_title,
+        languages,
+        lookup_failed
+    }
+    """
+    info = {
+        t: {
+            "normalized_title": normalize_title_fallback(t),
+            "qid": None,
+            "de_title": None,
+            "languages": [],
+            "lookup_failed": False,
+        }
+        for t in titles
+    }
+
+    for chunk_titles in chunks(titles, MW_TITLES_PER_REQUEST):
+        url = f"https://{lang}.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "titles": "|".join(chunk_titles),
+            "redirects": 1,
+            "prop": "pageprops|langlinks",
+            "lllang": "de",
+            "format": "json"
+        }
+
+        r = safe_get(url, params=params)
+        if not r:
+            for t in chunk_titles:
+                info[t]["lookup_failed"] = True
+            continue
+
+        data = r.json()
+        query = data.get("query", {})
+
+        alias_map = {}
+        for entry in query.get("normalized", []):
+            alias_map[entry["from"]] = entry["to"]
+        for entry in query.get("redirects", []):
+            alias_map[entry["from"]] = entry["to"]
+
+        pages = query.get("pages", {})
+        page_by_title = {}
+        for page in pages.values():
+            page_title = page.get("title")
+            if page_title:
+                page_by_title[page_title] = page
+
+        for original in chunk_titles:
+            resolved = alias_map.get(original, original)
+            page = page_by_title.get(resolved) or page_by_title.get(resolved.replace("_", " ")) or page_by_title.get(resolved.replace(" ", "_"))
+
+            if not page:
+                continue
+
+            normalized_title = page.get("title", original).replace(" ", "_")
+            qid = page.get("pageprops", {}).get("wikibase_item")
+
+            de_title = None
+            langlinks = page.get("langlinks", [])
+            if langlinks:
+                de_title = langlinks[0].get("*")
+
+            info[original]["normalized_title"] = normalized_title
+            info[original]["qid"] = qid
+            info[original]["de_title"] = de_title
+
+    # Wikidata fallback + languages
+    qids = [v["qid"] for v in info.values() if v["qid"]]
+    sitelinks_map = get_wikidata_sitelinks_batch(qids)
+
+    for original, meta in info.items():
+        qid = meta["qid"]
+        if not qid:
+            continue
+
+        sitelinks = sitelinks_map.get(qid, {})
+        if not meta["de_title"] and "dewiki" in sitelinks:
+            meta["de_title"] = sitelinks["dewiki"].get("title")
+
+        langs = [k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")]
+        langs_sorted = sorted(langs)
+        meta["languages"] = langs_sorted[:8] + (["..."] if len(langs_sorted) > 8 else [])
+
+    return info
+
+
+@st.cache_data(ttl=86400)
+def article_exists_in_de(title, lang="en"):
+    info = get_batch_article_info([title], lang=lang)
+    row = info.get(title, {})
+    return row.get("de_title") is not None
+
+
+# ---------- TOP ARTICLES ----------
+def get_top_articles(lang="en", days=1, limit=100):
+    titles = {}
+    today = datetime.today()
+
+    for delta in range(days):
+        day = (today - timedelta(days=delta + 1)).strftime("%Y/%m/%d")
+        url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/top/{lang}.wikipedia/all-access/{day}"
+        r = safe_get(url)
+        if not r:
+            continue
+
+        items = r.json().get("items", [])
+        if not items:
+            continue
+
+        for item in items[0].get("articles", []):
+            title = item.get("article")
+            views = item.get("views", 0)
+            if not title:
+                continue
+            if ":" in title or title.lower() in ["hauptseite", "main_page"]:
+                continue
+            titles[title] = titles.get(title, 0) + views
+
+    sorted_titles = sorted(titles.items(), key=lambda x: x[1], reverse=True)
+    return sorted_titles[:limit]
+
+
+# ---------- CATEGORY ----------
 def get_category_members(category_name, lang="en", limit=5000):
     category_prefix = "Kategorie:" if lang == "de" else "Category:"
     api_url = f"https://{lang}.wikipedia.org/w/api.php"
@@ -390,42 +397,6 @@ def get_all_articles_recursive(category_name, lang="en", depth=2, limit=5000):
     return collected[:limit], len(collected)
 
 
-def get_top_articles(lang="en", days=1, limit=100):
-    titles = {}
-    today = datetime.today()
-
-    for delta in range(days):
-        day = (today - timedelta(days=delta + 1)).strftime("%Y/%m/%d")
-        url = f"https://wikimedia.org/api/rest_v1/metrics/pageviews/top/{lang}.wikipedia/all-access/{day}"
-        r = safe_get(url)
-        if not r:
-            continue
-
-        items = r.json().get("items", [])
-        if not items:
-            continue
-
-        for item in items[0].get("articles", []):
-            title = item.get("article")
-            views = item.get("views", 0)
-            if not title:
-                continue
-            if ":" in title or title.lower() in ["hauptseite", "main_page"]:
-                continue
-            titles[title] = titles.get(title, 0) + views
-
-    return sorted(titles.items(), key=lambda x: x[1], reverse=True)[:limit]
-
-
-def get_missing_titles_parallel(titles, lang):
-    def check(title):
-        return title if not article_exists_in_de(title, lang=lang) else None
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        results = list(executor.map(check, titles))
-    return [title for title in results if title]
-
-
 # ---------- FRAUEN IN ROT ----------
 @st.cache_data(ttl=86400)
 def get_all_frauenrot_lists():
@@ -469,76 +440,95 @@ def extract_qids_from_list(url):
 
 @st.cache_data(ttl=86400)
 def get_sitelinks(qid):
-    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
-    r = safe_get(url)
-    if not r:
-        return {}
-    data = r.json()
-    return data.get("entities", {}).get(qid, {}).get("sitelinks", {})
+    sitelinks = get_wikidata_sitelinks_batch([qid])
+    return sitelinks.get(qid, {})
 
 
 # ---------- CORE PROCESSING ----------
-def process_articles_concurrent(titles, lang):
-    def process_single(title):
-        try:
-            normalized = normalize_title(title, lang=lang)
-            wikidata_id = get_wikidata_id(normalized, lang=source_lang)
-            if not wikidata_id:
-                wikidata_id = get_wikidata_id_via_titles(normalized, lang=source_lang)
-            de_exists = de_title is not None
+def process_articles_batch(
+    titles,
+    lang,
+    known_views=None,
+    view_column="Views (30d)",
+    include_summary=True,
+    include_stats=True,
+    max_workers=4,
+):
+    batch_info = get_batch_article_info(titles, lang=lang)
 
-            wikidata_id = get_wikidata_id(normalized, lang=lang)
-            langs = get_languages(wikidata_id) if wikidata_id else []
-            langs_str = ", ".join(langs)
+    def enrich(original_title):
+        meta = batch_info.get(original_title, {})
+        normalized_title = meta.get("normalized_title", normalize_title_fallback(original_title))
+        de_title = meta.get("de_title")
+        languages = meta.get("languages", [])
+        lookup_failed = meta.get("lookup_failed", False)
 
-            views = get_pageviews(normalized, lang=lang)
-            est_views = int(views * DE_ESTIMATE_FACTOR)
+        if de_title:
+            exists_in_de = "✅"
+        elif lookup_failed:
+            exists_in_de = "❓"
+        else:
+            exists_in_de = "❌"
 
-            avg, std_dev, cv, peak_ratio, virality = get_daily_views_stats(normalized, lang=lang)
-            summary = get_summary(normalized, lang=lang)
-            short_summary = summary[:180] + "..." if len(summary) > 180 else summary
+        wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(normalized_title)}"
 
-            wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(normalized)}"
+        row = {
+            "Title": f'<a href="{wiki_url}" target="_blank">{normalized_title.replace("_", " ")}</a>',
+            "German Title": de_title if de_title else "",
+            "Languages": ", ".join(languages),
+            "Exists in DE": exists_in_de,
+        }
 
-            return {
-                "Title": f'<a href="{wiki_url}" target="_blank">{normalized.replace("_", " ")}</a>',
-                "German Title": de_title if de_title else "",
-                "Languages": langs_str,
-                "Views (30d)": views,
-                "Estimated DE Views": est_views,
-                "Exists in DE": "✅" if de_exists else "❌",
-                "CV": cv,
-                "Viralität": virality,
-                "Summary": short_summary
-            }
+        # Views
+        if known_views is not None:
+            views = known_views.get(original_title)
+        else:
+            views = get_pageviews(normalized_title, lang=lang, days=30)
 
-        except Exception as e:
-            return {
-                "Title": title,
-                "German Title": "",
-                "Languages": "",
-                "Views (30d)": 0,
-                "Estimated DE Views": 0,
-                "Exists in DE": "❓",
-                "CV": None,
-                "Viralität": "Fehler",
-                "Summary": f"Fehler: {e}"
-            }
+        row[view_column] = views
+        row["Estimated DE Views"] = int(views * DE_ESTIMATE_FACTOR) if isinstance(views, (int, float)) else None
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        return list(executor.map(process_single, titles))
+        # Summary
+        if include_summary:
+            summary = get_summary(normalized_title, lang=lang) or ""
+            row["Summary"] = summary[:180] + "..." if len(summary) > 180 else summary
+
+        # Stats
+        if include_stats:
+            avg, std_dev, cv, peak_ratio, virality = get_daily_views_stats(normalized_title, lang=lang, days=30)
+            row["CV"] = cv
+            row["Viralität"] = virality
+        else:
+            row["CV"] = None
+            row["Viralität"] = ""
+
+        return row
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        rows = list(executor.map(enrich, titles))
+
+    return rows
 
 
 def process_articles_with_progress(titles, lang):
+    batch_info = get_batch_article_info(titles, lang=lang)
     results = []
     progress = st.progress(0)
     status = st.empty()
     total = len(titles)
 
     for i, title in enumerate(titles):
-        result = process_articles_concurrent([title], lang)
-        if result:
-            results.extend(result)
+        row = process_articles_batch(
+            [title],
+            lang=lang,
+            known_views=None,
+            view_column="Views (30d)",
+            include_summary=True,
+            include_stats=True,
+            max_workers=1,
+        )
+        if row:
+            results.extend(row)
         progress.progress((i + 1) / total)
         status.text(f"{i+1}/{total} Artikel verarbeitet")
 
@@ -546,23 +536,24 @@ def process_articles_with_progress(titles, lang):
 
 
 @st.cache_data(ttl=21600)
-def get_top_viral_articles(lang="en", limit=10, source_pool=100):
+def get_top_viral_articles(lang="en", limit=10, source_pool=20):
     top_articles = get_top_articles(lang=lang, days=1, limit=source_pool)
-    rows = []
+    titles = [title for title, _ in top_articles]
+    known_views = {title: views for title, views in top_articles}
 
-    for title, _ in top_articles:
+    def enrich(title):
         normalized = normalize_title(title, lang=lang)
-        yesterday_views = get_yesterday_views(normalized, lang=lang)
-        avg, std_dev, cv, peak_ratio, virality = get_daily_views_stats(normalized, lang=lang)
-
+        _, _, cv, _, virality = get_daily_views_stats(normalized, lang=lang, days=30)
         wiki_url = f"https://{lang}.wikipedia.org/wiki/{quote(normalized)}"
-
-        rows.append({
+        return {
             "Title": f'<a href="{wiki_url}" target="_blank">{normalized.replace("_", " ")}</a>',
-            "Views (Yesterday)": yesterday_views,
+            "Views (Yesterday)": known_views.get(title),
             "CV": cv,
-            "Viralität": virality
-        })
+            "Viralität": virality,
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        rows = list(executor.map(enrich, titles))
 
     df = pd.DataFrame(rows)
     df = prepare_dataframe_for_sorting(df)
@@ -573,9 +564,9 @@ def get_top_viral_articles(lang="en", limit=10, source_pool=100):
 # ---------- UI ----------
 st.title("Wikipedia Relevanz-Radar")
 
-tab_start, tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab_start, tab_info, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔥 Start",
-    "🙇🏻‍♂️ Info",
+    "🕵🏻 Info",
     "1) Kategorie-Analyse",
     "2) Meistgelesen vs. DE (Schnell)",
     "3) Meistgelesen vs. DE (Gefiltert)",
@@ -585,17 +576,15 @@ tab_start, tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 with tab_start:
     st.header("Aktuelle virale Top-Artikel von gestern")
-    st.markdown("Übersicht der aktuell auffälligen Artikel in **DE** und **EN**, sortiert nach Viralitäts-Score (CV).")
+    st.markdown("DE und EN, sortiert nach CV. Lädt nur auf Knopfdruck, damit die App schnell bleibt.")
 
-    load_start = st.button("Top virale Artikel laden", key="load_start_tab")
-
-    if load_start:
+    if st.button("Top virale Artikel laden", key="load_start_tab"):
         col1, col2 = st.columns(2)
 
         with col1:
             st.subheader("DE")
             with st.spinner("Lade DE-Trends..."):
-                df_de = get_top_viral_articles(lang="de", limit=10, source_pool=30)
+                df_de = get_top_viral_articles(lang="de", limit=10, source_pool=20)
             if not df_de.empty:
                 display_de = df_de.copy()
                 display_de["Views (Yesterday)"] = display_de["Views (Yesterday)"].apply(views_format)
@@ -606,7 +595,7 @@ with tab_start:
         with col2:
             st.subheader("EN")
             with st.spinner("Lade EN-Trends..."):
-                df_en = get_top_viral_articles(lang="en", limit=10, source_pool=30)
+                df_en = get_top_viral_articles(lang="en", limit=10, source_pool=20)
             if not df_en.empty:
                 display_en = df_en.copy()
                 display_en["Views (Yesterday)"] = display_en["Views (Yesterday)"].apply(views_format)
@@ -614,17 +603,18 @@ with tab_start:
             else:
                 st.info("Keine Daten verfügbar.")
     else:
-        st.info("Klicke auf „Top virale Artikel laden“, um die Übersicht zu berechnen.")
-        
-with tab0:
-    st.markdown("""
-Der **Wikipedia Relevanz-Radar** hilft dabei, relevante Artikel zu finden, die in anderen Sprachversionen stark gelesen werden.
+        st.info("Klicke auf „Top virale Artikel laden“.")
 
-Neu:
-- pro Tab kannst du **selbst umschalten**, ob Artikel mit vorhandener DE-Version angezeigt werden sollen
-- zusätzlicher Start-Tab mit **Top-Viral-Artikeln von gestern**
-- robustere DE-Erkennung über **langlinks + Wikidata**
-- neue Spalte **German Title**, damit sichtbar wird, welcher DE-Artikel gefunden wurde
+with tab_info:
+    st.markdown("""
+Dieses Tool sucht nach relevanten Artikeln in anderen Sprachversionen und prüft, ob sie in der deutschen Wikipedia existieren.
+
+Wichtige Punkte:
+- **Exists in DE = ✅**: deutscher Artikel wurde gefunden
+- **Exists in DE = ❌**: kein deutscher Artikel gefunden
+- **Exists in DE = ❓**: Prüfung war technisch unsicher / unvollständig
+
+Wenn der Filter „Artikel mit vorhandener DE-Version ausblenden“ aktiv ist, werden **nur bestätigte ❌** gezeigt.
 """)
 
 with tab1:
@@ -640,7 +630,7 @@ with tab1:
         st.session_state["category_total"] = 0
         st.session_state["category_members"] = []
 
-    if st.button("Kategorie analysieren & erste Artikel laden"):
+    if st.button("Kategorie analysieren & erste Artikel laden", key="tab1_first_load"):
         with st.spinner("Lade Kategorie..."):
             if use_subcats:
                 members, _ = get_all_articles_recursive(category_input, lang=lang_code, depth=2, limit=5000)
@@ -657,10 +647,18 @@ with tab1:
             to_process = st.session_state["category_members"][:50]
             with st.spinner("Analysiere Artikel..."):
                 titles = [a["title"] for a in to_process]
-                rows = process_articles_concurrent(titles, lang_code)
+                rows = process_articles_batch(
+                    titles,
+                    lang=lang_code,
+                    known_views=None,
+                    view_column="Views (30d)",
+                    include_summary=True,
+                    include_stats=True,
+                    max_workers=4,
+                )
                 st.session_state["category_results"].extend(rows)
                 st.session_state["category_results"].sort(
-                    key=lambda x: safe_numeric(x.get("Views (30d)", 0)),
+                    key=lambda x: safe_numeric(x.get("Views (30d)"), 0),
                     reverse=True
                 )
                 st.session_state["category_cursor"] += len(to_process)
@@ -671,13 +669,21 @@ with tab1:
         next_cursor = min(current_cursor + 50, total)
         to_process = st.session_state["category_members"][current_cursor:next_cursor]
 
-        if to_process and st.button(f"Nächste {len(to_process)} Artikel analysieren"):
+        if to_process and st.button(f"Nächste {len(to_process)} Artikel analysieren", key="tab1_next_load"):
             with st.spinner("Analysiere weitere Artikel..."):
                 titles = [a["title"] for a in to_process]
-                rows = process_articles_concurrent(titles, lang_code)
+                rows = process_articles_batch(
+                    titles,
+                    lang=lang_code,
+                    known_views=None,
+                    view_column="Views (30d)",
+                    include_summary=True,
+                    include_stats=True,
+                    max_workers=4,
+                )
                 st.session_state["category_results"].extend(rows)
                 st.session_state["category_results"].sort(
-                    key=lambda x: safe_numeric(x.get("Views (30d)", 0)),
+                    key=lambda x: safe_numeric(x.get("Views (30d)"), 0),
                     reverse=True
                 )
                 st.session_state["category_cursor"] += len(to_process)
@@ -687,15 +693,17 @@ with tab1:
         if display_rows:
             df = pd.DataFrame(display_rows)
             df = prepare_dataframe_for_sorting(df)
-            df = df.sort_values(by="Views (30d)", ascending=False)
+            df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
             st.markdown(f"**{st.session_state['category_cursor']} von {total} Artikeln analysiert.**")
             st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        else:
+            st.info("Keine passenden Artikel gefunden.")
 
 with tab2:
     st.header("2) Meistgelesen vs. DE (Schnell)")
     lang_code = st.selectbox("Quellsprache", options=SUPPORTED_LANGS, index=0, key="tab2_lang")
     period = st.selectbox("Zeitraum", ["Yesterday", "Past 30 Days (aggregated)"])
-    limit = st.slider("Anzahl Top-Artikel", 10, 5000, 1000)
+    limit = st.slider("Anzahl Top-Artikel", 10, 5000, 300)
     only_missing_tab2 = st.checkbox("Artikel mit vorhandener DE-Version ausblenden", value=True, key="tab2_only_missing")
 
     if st.button("Artikel laden", key="tab2_button"):
@@ -703,13 +711,25 @@ with tab2:
             days = 1 if period == "Yesterday" else 30
             top_articles = get_top_articles(lang=lang_code, days=days, limit=limit)
             titles = [title for title, _ in top_articles]
-            results = process_articles_concurrent(titles, lang_code)
+            known_views = {title: views for title, views in top_articles}
+            view_col = "Views (Yesterday)" if days == 1 else "Views (30d)"
+
+            results = process_articles_batch(
+                titles,
+                lang=lang_code,
+                known_views=known_views,
+                view_column=view_col,
+                include_summary=False,
+                include_stats=False,
+                max_workers=4,
+            )
+
             results = filter_missing_in_de(results, only_missing_tab2)
 
             if results:
                 df = pd.DataFrame(results)
                 df = prepare_dataframe_for_sorting(df)
-                df = df.sort_values(by="Views (30d)", ascending=False)
+                df = df.sort_values(by=view_col, ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button("CSV herunterladen", data=csv, file_name="top_articles.csv", mime="text/csv")
@@ -725,24 +745,35 @@ with tab3:
     with col1:
         days = st.selectbox("Zeitraum (Tage)", [7, 14, 30, 90], index=2)
     with col2:
-        limit = st.selectbox("Anzahl Artikel", [100, 250, 500, 1000], index=3)
+        limit = st.selectbox("Anzahl Artikel", [100, 250, 500, 1000], index=1)
 
     if st.button(f"Top Missing laden ({selected_lang} → DE)", key="tab3_button"):
         with st.spinner(f"Lade Top-Artikel aus {selected_lang}.wikipedia.org..."):
             top_articles = get_top_articles(lang=selected_lang, days=days, limit=limit)
             titles = [title for title, _ in top_articles]
+            known_views = {title: views for title, views in top_articles}
 
             if only_missing_tab3:
-                titles = get_missing_titles_parallel(titles, selected_lang)
+                batch_info = get_batch_article_info(titles, lang=selected_lang)
+                titles = [t for t in titles if batch_info.get(t, {}).get("de_title") is None and not batch_info.get(t, {}).get("lookup_failed", False)]
+                known_views = {t: known_views[t] for t in titles if t in known_views}
 
             if titles:
-                results = process_articles_with_progress(titles, selected_lang)
+                results = process_articles_batch(
+                    titles,
+                    lang=selected_lang,
+                    known_views=known_views,
+                    view_column="Views (30d)",
+                    include_summary=True,
+                    include_stats=True,
+                    max_workers=4,
+                )
                 results = filter_missing_in_de(results, only_missing_tab3)
 
                 if results:
                     df = pd.DataFrame(results)
                     df = prepare_dataframe_for_sorting(df)
-                    df = df.sort_values(by="Views (30d)", ascending=False)
+                    df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                     st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
                     csv = df.to_csv(index=False).encode("utf-8")
@@ -750,7 +781,7 @@ with tab3:
                 else:
                     st.info("Keine passenden Artikel gefunden.")
             else:
-                st.success("Keine passenden Artikel gefunden.")
+                st.info("Keine passenden Artikel gefunden.")
 
 with tab4:
     st.header("4) Rotlink-Frauen-Projekt")
@@ -774,7 +805,6 @@ with tab4:
                 all_qids.update(qids)
 
             rows = []
-            failed_qids = []
             total = len(all_qids)
             progress = st.progress(0)
             status_text = st.empty()
@@ -812,21 +842,26 @@ with tab4:
                     if not sizes:
                         raise ValueError("Keine Artikelgröße")
 
-                    max_lang, (max_bytes, max_title) = max(sizes.items(), key=lambda x: x[1][0])
+                    max_lang, (_, max_title) = max(sizes.items(), key=lambda x: x[1][0])
 
-                    views = get_pageviews(max_title, lang=max_lang)
-                    summary = get_summary(max_title, lang=max_lang)
-                    est_de = int(views * DE_ESTIMATE_FACTOR)
-                    de_title = get_german_article_title(max_title, source_lang=max_lang)
-                    exists_de = de_title is not None
+                    views = get_pageviews(max_title.replace(" ", "_"), lang=max_lang, days=30)
+                    summary = get_summary(max_title.replace(" ", "_"), lang=max_lang)
+                    est_de = int(views * DE_ESTIMATE_FACTOR) if isinstance(views, (int, float)) else None
+
+                    single_info = get_batch_article_info([max_title], lang=max_lang).get(max_title, {})
+                    de_title = single_info.get("de_title")
+                    if de_title:
+                        exists_de = "✅"
+                    elif single_info.get("lookup_failed", False):
+                        exists_de = "❓"
+                    else:
+                        exists_de = "❌"
 
                     wiki_url = f"https://{max_lang}.wikipedia.org/wiki/{quote(max_title.replace(' ', '_'))}"
                     query = f'"{max_title}" site:.de'
                     google_url = f"https://www.google.com/search?q={quote_plus(query)}"
 
-                    langs_str = ", ".join(sorted(
-                        [k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")]
-                    ))
+                    langs = sorted([k.replace("wiki", "") for k in sitelinks.keys() if k.endswith("wiki")])
 
                     return {
                         "Name": f'<a href="{wiki_url}" target="_blank">{max_title}</a>',
@@ -834,22 +869,29 @@ with tab4:
                         "Sprache (größte Version)": max_lang,
                         "Views (30d)": views,
                         "Estimated DE Views": est_de,
-                        "Exists in DE": "✅" if exists_de else "❌",
-                        "Sprachen": langs_str,
-                        "Summary": summary,
+                        "Exists in DE": exists_de,
+                        "Sprachen": ", ".join(langs[:8] + (["..."] if len(langs) > 8 else [])),
+                        "Summary": summary[:180] + "..." if len(summary) > 180 else summary,
                         "Google": f'<a href="{google_url}" target="_blank">Suchen</a>'
                     }
 
                 except Exception:
-                    failed_qids.append(qid)
-                    return None
+                    return {
+                        "Name": qid,
+                        "German Title": "",
+                        "Sprache (größte Version)": "",
+                        "Views (30d)": None,
+                        "Estimated DE Views": None,
+                        "Exists in DE": "❓",
+                        "Sprachen": "",
+                        "Summary": "Fehler",
+                        "Google": ""
+                    }
 
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {executor.submit(process_qid_robust, qid): qid for qid in all_qids}
                 for i, future in enumerate(as_completed(futures)):
-                    result = future.result()
-                    if result:
-                        rows.append(result)
+                    rows.append(future.result())
                     progress.progress((i + 1) / total if total else 1)
                     status_text.text(f"{i+1}/{total} verarbeitet...")
 
@@ -858,7 +900,7 @@ with tab4:
             if rows:
                 df = pd.DataFrame(rows)
                 df = prepare_dataframe_for_sorting(df)
-                df = df.sort_values(by="Views (30d)", ascending=False)
+                df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
                 csv = df.to_csv(index=False).encode("utf-8")
@@ -878,13 +920,21 @@ with tab5:
             st.info("Bitte mindestens einen Artikelnamen eingeben.")
         else:
             with st.spinner("Analysiere Artikel..."):
-                results = process_articles_concurrent(titles, input_lang)
+                results = process_articles_batch(
+                    titles,
+                    lang=input_lang,
+                    known_views=None,
+                    view_column="Views (30d)",
+                    include_summary=True,
+                    include_stats=True,
+                    max_workers=4,
+                )
                 results = filter_missing_in_de(results, only_missing_tab5)
 
             if results:
                 df = pd.DataFrame(results)
                 df = prepare_dataframe_for_sorting(df)
-                df = df.sort_values(by="Views (30d)", ascending=False)
+                df = df.sort_values(by="Views (30d)", ascending=False, na_position="last")
                 st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
                 csv = df.to_csv(index=False).encode("utf-8")
