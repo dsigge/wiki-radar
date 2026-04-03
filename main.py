@@ -556,32 +556,37 @@ tab_start, tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 with tab_start:
     st.header("Aktuelle virale Top-Artikel von gestern")
-    st.markdown("Automatische Übersicht der aktuell auffälligen Artikel in **DE** und **EN**, sortiert nach Viralitäts-Score (CV).")
+    st.markdown("Übersicht der aktuell auffälligen Artikel in **DE** und **EN**, sortiert nach Viralitäts-Score (CV).")
 
-    col1, col2 = st.columns(2)
+    load_start = st.button("Top virale Artikel laden", key="load_start_tab")
 
-    with col1:
-        st.subheader("DE")
-        with st.spinner("Lade DE-Trends..."):
-            df_de = get_top_viral_articles(lang="de", limit=10, source_pool=100)
-        if not df_de.empty:
-            display_de = df_de.copy()
-            display_de["Views (Yesterday)"] = display_de["Views (Yesterday)"].apply(views_format)
-            st.markdown(display_de.to_html(escape=False, index=False), unsafe_allow_html=True)
-        else:
-            st.info("Keine Daten verfügbar.")
+    if load_start:
+        col1, col2 = st.columns(2)
 
-    with col2:
-        st.subheader("EN")
-        with st.spinner("Lade EN-Trends..."):
-            df_en = get_top_viral_articles(lang="en", limit=10, source_pool=100)
-        if not df_en.empty:
-            display_en = df_en.copy()
-            display_en["Views (Yesterday)"] = display_en["Views (Yesterday)"].apply(views_format)
-            st.markdown(display_en.to_html(escape=False, index=False), unsafe_allow_html=True)
-        else:
-            st.info("Keine Daten verfügbar.")
+        with col1:
+            st.subheader("DE")
+            with st.spinner("Lade DE-Trends..."):
+                df_de = get_top_viral_articles(lang="de", limit=10, source_pool=30)
+            if not df_de.empty:
+                display_de = df_de.copy()
+                display_de["Views (Yesterday)"] = display_de["Views (Yesterday)"].apply(views_format)
+                st.markdown(display_de.to_html(escape=False, index=False), unsafe_allow_html=True)
+            else:
+                st.info("Keine Daten verfügbar.")
 
+        with col2:
+            st.subheader("EN")
+            with st.spinner("Lade EN-Trends..."):
+                df_en = get_top_viral_articles(lang="en", limit=10, source_pool=30)
+            if not df_en.empty:
+                display_en = df_en.copy()
+                display_en["Views (Yesterday)"] = display_en["Views (Yesterday)"].apply(views_format)
+                st.markdown(display_en.to_html(escape=False, index=False), unsafe_allow_html=True)
+            else:
+                st.info("Keine Daten verfügbar.")
+    else:
+        st.info("Klicke auf „Top virale Artikel laden“, um die Übersicht zu berechnen.")
+        
 with tab0:
     st.markdown("""
 Der **Wikipedia Relevanz-Radar** hilft dabei, relevante Artikel zu finden, die in anderen Sprachversionen stark gelesen werden.
